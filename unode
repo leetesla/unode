@@ -847,6 +847,92 @@ def show_startup_node(service=None):
     return 2 if result["status"] in ("mismatch", "manual") else 0
 
 
+def launchd_service_status(label, file=None):
+    """Separate an absent job from a failed query; never load a service."""
+    jobs, outputs, failures = [], [], []
+    for domain in ("gui/{}".format(os.getuid()), "user/{}".format(os.getuid()), "system"):
+        job = domain + "/" + label
+        result = run(["launchctl", "print", job], check=False)
+        if result.returncode == 0:
+            if file is not None:
+                origin = re.search(r"^\s*path = (.+)$", result.stdout, re.MULTILINE)
+                if not origin or Path(origin[1]).resolve() != file.resolve():
+                    raise UnodeError("launchd Label 已被其他或无法核实的服务使用：" + job)
+            jobs.append(job)
+            outputs.append(result.stdout)
+        else:
+            detail = (result.stderr or result.stdout).strip()
+            # launchctl prefixes a missing service with "Bad request." too.
+            # Match the specific diagnostic, not that ambiguous prefix or code.
+            if 'Could not find service "' + label + '" in domain' not in detail:
+                failures.append("{}：{}".format(domain, detail or "退出码 " + str(result.returncode)))
+    return {"status": "unknown" if failures else ("loaded" if jobs else "not-loaded"),
+            "jobs": jobs, "outputs": outputs, "failures": failures}
+
+
+def display_launchd_status(config, result):
+    for output in result["outputs"]:
+        print(output, end="" if output.endswith("\n") else "\n")
+    if result["status"] == "unknown":
+        print("无法完整查询 launchd 服务状态（权限或会话查询失败）：")
+        for failure in result["failures"]:
+            print("  " + failure)
+    elif result["status"] == "not-loaded":
+        if config.get("LaunchOnlyOnce") is True:
+            print("当前未注册：配置为一次性启动任务（LaunchOnlyOnce=true）。")
+            print("任务退出后 launchd 会移除注册；PM2 的 resurrect 命令返回后，后台仍可继续运行。")
+            print("任务当前是否注册与登录自启是否启用是两个独立状态。")
+        else:
+            print("服务当前未加载；配置文件存在不代表服务已启用。")
+            print("需要重建时执行 unode restartup（可能重启受管应用）。")
+
+
+def launchd_autostart_status(file, config):
+    """Inspect login-start configuration independently of one-shot registration."""
+    domain = "gui/{}".format(os.getuid())
+    result = run(["launchctl", "print-disabled", domain], check=False)
+    if result.returncode:
+        return {"status": "unknown", "details": "无法读取 {} 启用状态：{}".format(domain, (result.stderr or result.stdout).strip())}
+    # launchctl's human-readable format may change. Reject unfamiliar output
+    # rather than interpret an unparsed/missing entry as an enabled service.
+    table = re.fullmatch(r"\s*disabled services = \{(.*?)\}\s*", result.stdout, re.DOTALL)
+    overrides = {}
+    if table:
+        for line in table[1].splitlines():
+            if not line.strip():
+                continue
+            entry = re.fullmatch(r'\s*"([^"\n]+)"\s*=>\s*(enabled|disabled|true|false)\s*;?\s*', line)
+            if not entry or entry[1] in overrides:
+                table = None
+                break
+            overrides[entry[1]] = entry[2] in ("disabled", "true")
+    if not table:
+        return {"status": "unknown", "details": "无法识别 launchctl print-disabled 输出，未推断启用状态"}
+    disabled = overrides.get(config["Label"], config.get("Disabled", False))
+    if not isinstance(disabled, bool):
+        return {"status": "unknown", "details": "plist Disabled 字段格式异常"}
+    if disabled:
+        return {"status": "disabled", "details": "launchd 已禁用此用户任务"}
+    try:
+        info = file.stat()
+        if info.st_uid not in (0, os.getuid()) or info.st_mode & 0o022:
+            return {"status": "unknown", "details": "启动配置所有者或写权限不符合 launchd 要求"}
+    except OSError as exc:
+        return {"status": "unknown", "details": "启动配置无法读取：" + str(exc)}
+    sessions = config.get("LimitLoadToSessionType", ["Aqua"])
+    if isinstance(sessions, str):
+        sessions = [sessions]
+    if not isinstance(sessions, list) or "Aqua" not in sessions:
+        return {"status": "unknown", "details": "启动配置限制了登录会话类型，需复核触发条件"}
+    if any(config.get(key) for key in ("LimitLoadToHardware", "LimitLoadFromHardware")):
+        return {"status": "unknown", "details": "启动配置包含硬件条件，需复核触发条件"}
+    if not (config.get("RunAtLoad") is True or config.get("KeepAlive") is True or config.get("OnDemand") is False):
+        return {"status": "not-configured", "details": "未配置加载时立即启动；可能按其他条件触发"}
+    source = "launchd 显式启用" if config["Label"] in overrides else "未设置禁用覆盖，使用 plist 默认启用状态"
+    return {"status": "enabled", "details": "LaunchAgent 配置存在、加载时启动、" + source,
+            "domain": domain}
+
+
 def show_startup(service=None):
     """Inspect startup definitions without requiring Node, PM2, or a terminal."""
     system = platform.system()
@@ -860,18 +946,16 @@ def show_startup(service=None):
         # plistlib also handles binary plists; display them as readable XML.
         print(plistlib.dumps(config, sort_keys=False).decode("utf-8"), end="", flush=True)
         exit_code = show_startup_node(service)
+        autostart = launchd_autostart_status(file, config)
+        labels = {"enabled": "已启用（当前用户登录后自动启动）", "disabled": "已禁用",
+                  "not-configured": "未配置登录时立即启动", "unknown": "无法确认启用状态"}
+        colors = {"enabled": "32", "disabled": "31", "not-configured": "33", "unknown": "33"}
+        print("\n" + highlight("开机自启：" + labels[autostart["status"]], colors[autostart["status"]]), flush=True)
+        print("判断依据：" + autostart["details"], flush=True)
         print("\n服务状态（Label={}）：".format(label), flush=True)
-        failures = []
-        for domain in ("gui/{}".format(os.getuid()), "user/{}".format(os.getuid()), "system"):
-            result = run(["launchctl", "print", domain + "/" + label], check=False)
-            if result.returncode == 0:
-                print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
-                return exit_code
-            failures.append("{}：{}".format(domain, (result.stderr or result.stdout).strip()))
-        print("未能读取已加载的服务状态（可能尚未加载或当前会话无权查询）。")
-        for failure in failures:
-            print("  " + failure)
-        return exit_code
+        status = launchd_service_status(label)
+        display_launchd_status(config, status)
+        return 2 if status["status"] == "unknown" or autostart["status"] == "unknown" else exit_code
     if system == "Linux":
         if not shutil.which("systemctl"):
             raise UnodeError("未检测到 systemctl；show startup 的 Linux 支持需要 systemd")
@@ -1040,17 +1124,10 @@ def restartup_parser():
 
 
 def launchd_jobs(label, file):
-    jobs = []
-    for domain in ("gui/{}".format(os.getuid()), "user/{}".format(os.getuid()), "system"):
-        job = domain + "/" + label
-        result = run(["launchctl", "print", job], check=False)
-        if not result.returncode:
-            # Refuse a same-label service belonging to a different plist/user.
-            origin = re.search(r"^\s*path = (.+)$", result.stdout, re.MULTILINE)
-            if not origin or Path(origin[1]).resolve() != file.resolve():
-                raise UnodeError("launchd Label 已被其他或无法核实的服务使用：" + job)
-            jobs.append(job)
-    return jobs
+    result = launchd_service_status(label, file)
+    if result["status"] == "unknown":
+        raise UnodeError("无法完整查询 launchd 服务状态：" + "；".join(result["failures"]))
+    return result["jobs"]
 
 
 def restartup_context(args, target):
@@ -1201,7 +1278,8 @@ def perform_restartup(args, target, state, context=None):
             _, config = launchagent_config(context["service"])
             if config.get("EnvironmentVariables", {}).get("PM2_HOME") != str(args.pm2_home):
                 raise UnodeError("新启动配置的 PM2_HOME 不符")
-            if not launchd_jobs(config["Label"], file):
+            registered = bool(launchd_jobs(config["Label"], file))
+            if not registered and config.get("LaunchOnlyOnce") is not True:
                 raise UnodeError("新 launchd 服务未加载")
         after = wait_startup_apps(before, target, package, args.pm2_home, args.settle)
         state.write(state.folder / "restartup-after.json", after)
@@ -1213,7 +1291,21 @@ def perform_restartup(args, target, state, context=None):
         if context["platform"] == "systemd":
             result = startup_check(args.pm2_home, target, args.service)
         else:
-            result = {"status": "config-passed", "details": "启动配置、服务加载及应用已验证；未验证机器重启"}
+            # PM2's one-shot launch command can exit during the settle period.
+            # Record the final registration state instead of a stale observation.
+            jobs = launchd_jobs(config["Label"], file)
+            if not jobs and config.get("LaunchOnlyOnce") is not True:
+                raise UnodeError("应用验收后 launchd 服务已不再加载")
+            result = {"status": "config-passed", "jobs": jobs,
+                      "registration_observed": registered or bool(jobs),
+                      "details": "启动配置、服务加载及应用已验证；未验证机器重启"}
+            if not jobs:
+                result.update(launchd_status="oneshot-unregistered",
+                              details="启动配置及应用已验证；一次性任务当前未注册；未验证下次登录/重启恢复")
+                if not registered:
+                    result.update(status="needs-review", details="启动配置及应用已验证；未观察到一次性任务注册，无法确认启动执行结果；未验证下次登录/重启恢复")
+            else:
+                result["launchd_status"] = "loaded"
         state.write(state.folder / "startup-check.json", result)
         return result
     except BaseException as exc:
