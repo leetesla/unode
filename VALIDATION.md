@@ -2,6 +2,20 @@
 
 日期：2026-10-27，当前源码版本 0.1.2。测试平台：macOS。本次更新全局安装的 unode，保留 `/etc/unode/config.json`；没有升级真实用户的 Node、修改业务 PM2 或重启真实系统服务。此前对用户真实 PM2 仅做了直接 RPC 只读检查，确认 13 个 online、4 个普通 stopped 应用；没有对它们执行 update/save/stop/start/kill。
 
+## launchd 一次性任务状态提示修复
+
+- 本机复现 `gui/501`、`user/501`、`system` 均返回 `Bad request / Could not find service "com.PM2"`。现有 PM2 模板包含 `LaunchOnlyOnce=true`；只读 RPC 确认 PM2 后台 PID 1270、Node 22.23.4，13 个 online、4 个 stopped 应用。
+- 使用独立临时 Label、临时 plist 和 `/usr/bin/true` 实测 launchd：`bootstrap` 均成功；1 秒后，一次性任务查询退出码为 113，未设置一次性模式的对照任务仍已注册且 `last exit code = 0`。测试任务均已清理；没有加载或卸载真实 PM2 服务。
+- `show startup` 区分服务不存在与真正查询失败；一次性任务缺席时解释退出后移除注册，不将其推断为成功或失败，不重复输出三个域的预期缺席报错。普通服务未加载仍明确提示，权限/会话查询失败保留错误并返回 2。
+- 重建流程在应用稳定性检查后重新查询注册，记录当前状态与是否观察到注册。一次性任务在等待期间退出不再误报失败；从未观察到注册则标记待复核，普通服务意外消失仍报错。查询失败时禁止继续修改状态未知的服务。
+- Python 回归共 100 项：98 项通过，2 项需显式启用的真实 PM2 集成测试跳过。Python 3.8 语法兼容检查、`git diff --check` 通过。
+- 源码 `./unode show startup` 实机输出“一次性启动任务当前未注册”，Node 版本匹配，退出码 0；真实用户 PM2 仅通过内部 RPC 读取状态。
+- 修复前后真实 PM2 后台 PID、应用状态数量、plist 与 dump 的 SHA-256 保持一致，摘要见 `work/startup-status-before.json` 和 `work/startup-status-after.json`。首版修复已通过管理员认证安装到 `/usr/local/lib/unode/97d55d81d754483eb142/unode`。
+- 后续补充自启启用状态的独立判断：读取 `launchctl print-disabled gui/501`，本机 `com.PM2 => enabled`、plist `RunAtLoad=true`，明确显示“开机自启：已启用（当前用户登录后自动启动）”。一次性任务当前是否注册不再影响对自启启用状态的判断。
+- 新增覆盖显式禁用优先、显式启用覆盖 plist 默认禁用、缺省继承 plist、旧版布尔输出、加载时触发条件、查询失败、未知输出格式和会话限制的测试。
+- 补充自启判断后，108 项 Python 测试中 106 项通过、2 项显式启用的真实 PM2 测试跳过，Python 3.8 语法与 diff 检查通过。最新源码已安装至 `/usr/local/lib/unode/4436765f63bdb56778a1/unode`；全局命令逐字节一致，实机输出“开机自启：已启用（当前用户登录后自动启动）”，退出码 0。日志：`work/startup-autostart-installed.log`。再次只读 RPC 检查确认真实 PM2 PID、应用状态和 plist/dump 哈希保持不变。
+- 自启状态增加整行加粗高亮：已启用绿色、已禁用红色、未配置或未知黄色。真实伪终端验证已启用整行输出 ANSI 绿色加粗，`NO_COLOR` 和非终端输出保持纯文本；已安装至 `/usr/local/lib/unode/85a67d241901caf9f628/unode`，确认全局命令与源码一致并通过真实终端检查。
+
 ## restartup 与 nvm 全局包交互（0.1.2）
 
 - 新增独立 `unode restartup`、只读 `unode restartup --check`；普通升级在执行计划前询问是否 restartup，默认 y，选择写入 plan，完成后按选择执行、不再询问。独立命令不重复确认，sudo 授权照常保留。

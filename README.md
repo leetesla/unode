@@ -123,6 +123,10 @@ unode show startup --service my-pm2  # 自定义服务/LaunchAgent 文件名
 
 此命令可以在非交互环境运行，无需预先安装 Node、PM2 或公共配置文件。macOS 默认读取 `~/Library/LaunchAgents/pm2.用户名.plist`，根据文件中的实际 Label 查询 launchd 用户会话状态；`--service` 可带 `.plist` 后缀。Linux/systemd 使用 `systemctl cat` 显示 unit 路径、配置及 drop-in，并显示服务状态；默认服务名 `pm2-用户名.service`，`--service` 可省略 `.service`。同时显示启动配置使用的 Node 版本及实际路径；Node 缺失时明确标记未验证。服务未运行时仍可查看配置；查看配置成功不代表服务已启用或机器重启恢复已经验证。
 
+macOS 会单独显示“开机自启：已启用/已禁用/未配置登录时立即启动/无法确认启用状态”。判断依据包括现有 LaunchAgent 配置、`RunAtLoad` 等加载时启动条件，以及 `launchctl print-disabled gui/UID` 的持久启用状态；显式启用/禁用覆盖 plist 中的 `Disabled` 默认值。用户 LaunchAgent 的启动时机是当前用户登录后；输出格式无法解析、权限查询失败或特殊会话限制时明确提示无法确认，返回退出码 2。
+
+PM2 的 macOS 模板包含 `LaunchOnlyOnce=true`：`pm2 resurrect` 命令退出后，launchd 会移除一次性任务的注册，PM2 后台仍可继续运行。因此 `launchctl print` 返回 `Bad request / Could not find service` 并不一定是故障。`show startup` 会将这种情况说明为“一次性启动任务当前未注册”，与自启启用状态分别显示；普通服务未加载和真正的权限/会话查询失败分别提示，查询失败返回退出码 2。此命令不会重新加载任务或重启应用。自启已启用表示当前配置会在登录时触发，不能代替一次真实重启后的业务恢复验收。
+
 `show startup` 优先与 `~/.unode/last-run.json`（或 `UNODE_HOME`）记录的最近一次完成的目标版本比较，标注为“最近安装目标”。没有有效完成记录时才与当前终端的 Node 比较，并明确标注来源；两者都不可用时提示无法比较。版本不一致标红并返回退出码 2，避免仅显示旧版本却没有差异提示。
 
 每次正式完成 Node 安装或选择已有版本后，都会校验启动配置中的 Node 与本次目标版本是否一致，包括选择跳过 PM2 迁移的情况。版本高亮显示，一致标绿、不一致标红、配置缺失或无法解析标黄；`NO_COLOR` 和非终端输出保持纯文本。版本不一致或已有配置无法校验时，保留安装结果并以退出码 2 提示待处理；未选择 restartup 时，缺失配置只提示，不创建服务。结果写入 `startup-node-check.json` 和 `last-run.json` 的 `startup_node` 字段。
@@ -131,7 +135,7 @@ unode show startup --service my-pm2  # 自定义服务/LaunchAgent 文件名
 
 `show startup` 和 `--check` 只检查配置。Linux/systemd 会检查服务用户、PM2_HOME、PATH 对应 Node、ExecStart、启用状态、MainPID、NeedDaemonReload、dump 中的入口/工作目录/解释器。默认服务名 `pm2-用户名.service`，自定义名称使用 `--service`。
 
-macOS 的 LaunchAgent 与用户登录会话有关。未执行 restartup 时，PM2 迁移中的完整开机配置检查仍标记待人工复核；restartup 会检查已加载的实际 Label 和应用状态，不宣称已验证机器重启恢复。
+macOS 的 LaunchAgent 与用户登录会话有关。未执行 restartup 时，PM2 迁移中的完整开机配置检查仍标记待人工复核；restartup 会检查实际 Label 和应用状态，并在应用稳定性验收后重新查询注册状态。一次性任务已退出时会记录当前未注册；如果整个检查期间都未观察到注册，标记待复核并返回退出码 2。普通任务意外消失仍报错，不宣称已验证机器重启恢复。
 
 独立重建使用当前终端的 Node，先切换到你要使用的版本：
 
