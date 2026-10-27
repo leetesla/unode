@@ -14,7 +14,8 @@ from test_unode import u, application, snapshot
 
 
 class RestartupTests(unittest.TestCase):
-    def scenario(self, system="systemd", exists=True, fail=None, no_daemon=False, node_match=True):
+    def scenario(self, system="systemd", exists=True, fail=None, no_daemon=False, node_match=True,
+                 once=False, disappears=False, never_registered=False):
         with tempfile.TemporaryDirectory() as temp, ExitStack() as stack:
             root = Path(temp)
             home = root / "custom-pm2"
@@ -63,8 +64,9 @@ class RestartupTests(unittest.TestCase):
                     backend["loaded"], backend["daemon"] = False, False
                 elif verb == "startup":
                     if system == "launchd":
-                        file.write_bytes(u.plistlib.dumps({"Label": "com.PM2", "EnvironmentVariables": {"PM2_HOME": str(home)}}))
-                        backend["loaded"], backend["daemon"] = True, True
+                        file.write_bytes(u.plistlib.dumps({"Label": "com.PM2", "LaunchOnlyOnce": once,
+                                                         "EnvironmentVariables": {"PM2_HOME": str(home)}}))
+                        backend["loaded"], backend["daemon"] = not never_registered, True
                     else:
                         file.write_text("new startup definition\n")
                 elif verb == "start":
@@ -82,6 +84,13 @@ class RestartupTests(unittest.TestCase):
             stack.enter_context(patch.object(u, "launchagent_config", side_effect=lambda *a: (file, u.plistlib.loads(file.read_bytes()))))
             stack.enter_context(patch.object(u, "startup_check", return_value={"status": "config-passed"}))
             stack.enter_context(patch.object(u, "startup_node_check", return_value={"status": "match" if node_match else "mismatch", "node": target}))
+            original_wait = u.wait_startup_apps
+            def wait(*arguments):
+                result = original_wait(*arguments)
+                if disappears:
+                    backend["loaded"] = False
+                return result
+            stack.enter_context(patch.object(u, "wait_startup_apps", side_effect=wait))
             stack.enter_context(redirect_stdout(io.StringIO()))
             if fail == "authorization":
                 authorize.side_effect = u.UnodeError("authorization rejected")
@@ -115,6 +124,27 @@ class RestartupTests(unittest.TestCase):
         result = self.scenario(system="launchd")
         self.assertEqual(result["events"], ["save", "unstartup", "bootout", "startup", "644"])
         self.assertIsNone(result["error"])
+
+    def test_launchd_oneshot_can_unregister_during_app_verification(self):
+        result = self.scenario(system="launchd", once=True, disappears=True)
+        self.assertIsNone(result["error"])
+        self.assertTrue(result["daemon"])
+        self.assertEqual(result["result"]["status"], "config-passed")
+        self.assertEqual(result["result"]["launchd_status"], "oneshot-unregistered")
+        self.assertTrue(result["result"]["registration_observed"])
+        self.assertNotIn("服务加载及应用已验证", result["result"]["details"])
+
+    def test_launchd_unobserved_oneshot_registration_remains_unverified(self):
+        result = self.scenario(system="launchd", once=True, never_registered=True)
+        self.assertIsNone(result["error"])
+        self.assertTrue(result["daemon"])
+        self.assertEqual(result["result"]["status"], "needs-review")
+        self.assertFalse(result["result"]["registration_observed"])
+        self.assertIn("无法确认启动执行结果", result["result"]["details"])
+
+    def test_launchd_regular_service_disappearing_is_a_failure(self):
+        result = self.scenario(system="launchd", disappears=True)
+        self.assertIn("不再加载", result["error"])
 
     def test_unstartup_failure_does_not_run_startup(self):
         result = self.scenario(fail="unstartup")
@@ -218,6 +248,11 @@ class RestartupEnvironmentTests(unittest.TestCase):
     def test_other_launchd_job_is_not_unloaded(self):
         output = subprocess.CompletedProcess([], 0, "path = /Users/another/pm2.plist\n", "")
         with patch.object(u, "run", return_value=output), self.assertRaises(u.UnodeError):
+            u.launchd_jobs("com.PM2", Path("/Users/app/pm2.plist"))
+
+    def test_launchd_query_failure_prevents_modifying_unknown_services(self):
+        with patch.object(u, "run", return_value=subprocess.CompletedProcess([], 1, "", "Operation not permitted")), \
+                self.assertRaisesRegex(u.UnodeError, "无法完整查询"):
             u.launchd_jobs("com.PM2", Path("/Users/app/pm2.plist"))
 
     def test_restartup_check_has_no_authorization_or_state_writes(self):

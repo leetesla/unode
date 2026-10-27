@@ -414,10 +414,11 @@ class ShowStartupTests(unittest.TestCase):
             file.parent.mkdir(parents=True)
             file.write_bytes(u.plistlib.dumps({"Label": "com.PM2", "ProgramArguments": ["/runtime/node"]},
                                             fmt=u.plistlib.FMT_BINARY))
-            results = [subprocess.CompletedProcess([], 1, "", "not found"),
-                       subprocess.CompletedProcess([], 0, "state = running\n", "")]
+            missing = subprocess.CompletedProcess([], 113, "", 'Bad request.\nCould not find service "com.PM2" in domain')
+            results = [missing, subprocess.CompletedProcess([], 0, "state = running\n", ""), missing]
             with patch.object(u.platform, "system", return_value="Darwin"), patch.object(u.Path, "home", return_value=Path(temp)), \
                     patch.object(u, "startup_reference", return_value=(None, "目标")), \
+                    patch.object(u, "launchd_autostart_status", return_value={"status": "enabled", "details": "fixture"}), \
                     patch.object(u, "startup_node_check", return_value={"status": "inspected", "node": {"version": "22.20.0", "path": "/runtime/node"}}), \
                     patch.object(u, "run", side_effect=results) as run, redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(u.main(["show", "startup", "--service", "custom.plist"]), 0)
@@ -426,6 +427,51 @@ class ShowStartupTests(unittest.TestCase):
             self.assertIn(str(file), output.getvalue())
             self.assertIn("22.20.0", output.getvalue())
             self.assertIn("state = running", output.getvalue())
+
+    def test_mac_absent_oneshot_explains_lifecycle_without_claiming_success(self):
+        config = {"Label": "com.PM2", "LaunchOnlyOnce": True}
+        missing = subprocess.CompletedProcess([], 113, "", 'Bad request.\nCould not find service "com.PM2" in domain for user gui: 501')
+        with patch.object(u.platform, "system", return_value="Darwin"), \
+                patch.object(u, "launchagent_config", return_value=(Path("/unused/pm2.plist"), config)), \
+                patch.object(u, "show_startup_node", return_value=0), \
+                patch.object(u, "launchd_autostart_status", return_value={"status": "enabled", "details": "fixture"}), \
+                patch.object(u, "run", return_value=missing) as run, \
+                patch.object(u, "startup_admin", side_effect=AssertionError("read only")), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(u.show_startup(), 0)
+        self.assertEqual(len(run.call_args_list), 3)
+        self.assertTrue(all(call.args[0][:2] == ["launchctl", "print"] for call in run.call_args_list))
+        self.assertIn("一次性启动任务", output.getvalue())
+        self.assertIn("开机自启：已启用（当前用户登录后自动启动）", output.getvalue())
+        self.assertIn("两个独立状态", output.getvalue())
+        self.assertNotIn("Bad request", output.getvalue())
+        self.assertNotIn("无权查询", output.getvalue())
+
+    def test_mac_absent_regular_service_is_not_reported_as_oneshot(self):
+        missing = subprocess.CompletedProcess([], 113, "", 'Could not find service "custom" in domain')
+        with patch.object(u, "run", return_value=missing), redirect_stdout(io.StringIO()) as output:
+            result = u.launchd_service_status("custom")
+            u.display_launchd_status({"Label": "custom"}, result)
+        self.assertEqual(result["status"], "not-loaded")
+        self.assertIn("服务当前未加载", output.getvalue())
+        self.assertNotIn("一次性", output.getvalue())
+
+    def test_mac_permission_error_is_not_hidden_by_oneshot_config(self):
+        missing = subprocess.CompletedProcess([], 113, "", 'Could not find service "com.PM2" in domain')
+        denied = subprocess.CompletedProcess([], 1, "", "Operation not permitted")
+        with patch.object(u.platform, "system", return_value="Darwin"), \
+                patch.object(u, "launchagent_config", return_value=(Path("/unused/pm2.plist"), {"Label": "com.PM2", "LaunchOnlyOnce": True})), \
+                patch.object(u, "show_startup_node", return_value=0), \
+                patch.object(u, "launchd_autostart_status", return_value={"status": "enabled", "details": "fixture"}), \
+                patch.object(u, "run", side_effect=[missing, denied, missing]), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(u.show_startup(), 2)
+        self.assertIn("Operation not permitted", output.getvalue())
+        self.assertIn("权限或会话查询失败", output.getvalue())
+        self.assertNotIn("当前未注册", output.getvalue())
+
+    def test_mac_ambiguous_bad_request_is_a_query_error(self):
+        with patch.object(u, "run", return_value=subprocess.CompletedProcess([], 1, "", "Bad request.")):
+            result = u.launchd_service_status("com.PM2")
+        self.assertEqual(result["status"], "unknown")
 
     def test_linux_displays_inactive_service_and_dropins(self):
         results = [subprocess.CompletedProcess([], 0, "# /etc/systemd/system/custom.service\n# drop-in\n", ""),
@@ -457,6 +503,58 @@ class ShowStartupTests(unittest.TestCase):
                     patch.object(u.shutil, "which", return_value="/bin/systemctl"), \
                     patch.object(u, "run", side_effect=AssertionError("invalid input must not execute")), self.assertRaises(u.UnodeError):
                 u.show_startup("../../other")
+
+
+class LaunchdAutostartTests(unittest.TestCase):
+    def status(self, output='disabled services = {\n"com.PM2" => enabled\n}', code=0, **fields):
+        with tempfile.TemporaryDirectory() as temp:
+            file = Path(temp) / "pm2.plist"
+            file.write_bytes(b"fixture")
+            config = {"Label": "com.PM2", "RunAtLoad": True, **fields}
+            with patch.object(u, "run", return_value=subprocess.CompletedProcess([], code, output, "query error" if code else "")) as run:
+                result = u.launchd_autostart_status(file, config)
+            self.assertEqual(run.call_args.args[0], ["launchctl", "print-disabled", "gui/{}".format(os.getuid())])
+            return result
+
+    def test_explicit_enable_overrides_disabled_plist(self):
+        self.assertEqual(self.status(Disabled=True)["status"], "enabled")
+
+    def test_disabled_override_takes_precedence_over_run_at_load(self):
+        for value in ("disabled", "true"):
+            with self.subTest(value=value):
+                self.assertEqual(self.status('disabled services = {\n"com.PM2" => ' + value + '\n}')["status"], "disabled")
+
+    def test_absent_override_uses_plist_default(self):
+        self.assertEqual(self.status("disabled services = {}")["status"], "enabled")
+        self.assertEqual(self.status("disabled services = {}", Disabled=True)["status"], "disabled")
+        self.assertEqual(self.status('disabled services = {\n"comXPM2" => disabled\n}')["status"], "enabled")
+
+    def test_old_boolean_override_format(self):
+        self.assertEqual(self.status('disabled services = {\n"com.PM2" => false;\n}')["status"], "enabled")
+
+    def test_run_at_load_is_required_unless_keepalive_starts_at_load(self):
+        self.assertEqual(self.status(RunAtLoad=False)["status"], "not-configured")
+        self.assertEqual(self.status(RunAtLoad=False, KeepAlive=True)["status"], "enabled")
+        self.assertEqual(self.status(RunAtLoad=False, OnDemand=False)["status"], "enabled")
+
+    def test_query_failure_or_unrecognized_output_never_means_enabled(self):
+        for output, code in (("", 1), ("new unknown format", 0), ('disabled services = {\n"com.PM2" => perhaps\n}', 0)):
+            with self.subTest(output=output, code=code):
+                self.assertEqual(self.status(output, code)["status"], "unknown")
+
+    def test_session_restrictions_are_not_ignored(self):
+        self.assertEqual(self.status(LimitLoadToSessionType="Background")["status"], "unknown")
+        self.assertEqual(self.status(LimitLoadToSessionType=["Aqua", "Background"])["status"], "enabled")
+
+    def test_show_preserves_unknown_enablement_even_for_oneshot(self):
+        with patch.object(u.platform, "system", return_value="Darwin"), \
+                patch.object(u, "launchagent_config", return_value=(Path("/unused/pm2.plist"), {"Label": "com.PM2", "LaunchOnlyOnce": True})), \
+                patch.object(u, "show_startup_node", return_value=0), \
+                patch.object(u, "launchd_autostart_status", return_value={"status": "unknown", "details": "query failure"}), \
+                patch.object(u, "launchd_service_status", return_value={"status": "not-loaded", "outputs": [], "failures": []}), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(u.show_startup(), 2)
+        self.assertIn("开机自启：无法确认启用状态", output.getvalue())
+        self.assertIn("query failure", output.getvalue())
 
 
 class StartupReferenceTests(unittest.TestCase):
