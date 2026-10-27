@@ -1,0 +1,1517 @@
+#!/usr/bin/env python3
+"""Interactive Node upgrades and optional PM2 migration (standard library only)."""
+
+import argparse
+from collections import Counter
+from contextlib import contextmanager, ExitStack
+from datetime import datetime, timezone
+import fcntl
+import json
+import os
+from pathlib import Path
+import platform
+import plistlib
+import pwd
+import re
+import select
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+import tty
+import urllib.error
+import urllib.parse
+import urllib.request
+from xml.parsers.expat import ExpatError
+
+VERSION = "0.1.2"
+HELPER = Path(__file__).resolve().with_name("pm2-helper.cjs")
+NODE_INDEX = "https://nodejs.org/dist/index.json"
+NVM_RELEASE = "v0.40.8"
+EXACT = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+SELECTOR = re.compile(r"^v?\d+(?:\.\d+){0,2}$")
+NODE_INFO = "JSON.stringify({version:process.versions.node,path:process.execPath})"
+
+
+class UnodeError(Exception):
+    pass
+
+
+def parser():
+    cli = argparse.ArgumentParser(prog="unode", description="交互式升级 Node；可选择是否处理 PM2。默认管理方式 nvm。",
+                                  epilog="查看启动配置：unode show startup；重建启动配置：unode restartup")
+    cli.add_argument("version", nargs="?", help="目标版本，如 24、24.14.0、lts、latest")
+    cli.add_argument("--m", choices=["nvm", "fnm", "n", "system", "path"], help="预选 Node 管理方式")
+    cli.add_argument("--pm2", action="store_true", help="仅处理 PM2，以当前 Node 为目标")
+    cli.add_argument("--check", action="store_true", help="仅检查/显示计划，不安装或重启；可在非交互环境使用")
+    cli.add_argument("--config", type=Path, help="公共配置文件（默认 /etc/unode/config.json；也可设 UNODE_CONFIG）")
+    cli.add_argument("--node-path", type=Path, help="path 模式下的 Node 可执行文件")
+    cli.add_argument("--pm2-dir", type=Path, help="原 PM2 包目录（含 package.json、bin/pm2）")
+    cli.add_argument("--pm2-home", type=Path, default=Path(os.environ.get("PM2_HOME", str(Path.home() / ".pm2"))), help="现有 PM2_HOME")
+    cli.add_argument("--health-url", help="可选的 HTTP(S) 业务健康检查地址")
+    cli.add_argument("--settle", type=int, help="PM2 连续稳定观察秒数，默认读取公共配置（初始 30）")
+    cli.add_argument("--allow-kill", action="store_true", help="允许后台仍为旧 Node 时才 kill/resurrect；仍需确认整体计划")
+    cli.add_argument("--service", help="自定义 systemd 服务名或 macOS LaunchAgent 文件名")
+    cli.add_argument("--version", action="version", version="unode " + VERSION)
+    return cli
+
+
+def run(args, env=None, timeout=60, check=True, log=None):
+    args = [str(a) for a in args]
+    try:
+        result = subprocess.run(args, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise UnodeError("命令无法完成：{}（{}）".format(shlex.join(args[:2]), exc))
+    if log:
+        with open(log, "a", encoding="utf-8") as output:
+            output.write("$ " + shlex.join(args) + "\n" + result.stdout + result.stderr + "\n")
+    if check and result.returncode:
+        detail = (result.stderr or result.stdout).strip()[-1800:]
+        raise UnodeError("命令失败：{}\n{}".format(shlex.join(args[:3]), detail))
+    return result
+
+
+def interactive():
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def highlight(value, color="36"):
+    if sys.stdout.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb":
+        return "\033[1;" + color + "m" + str(value) + "\033[0m"
+    return str(value)
+
+
+def dim(value):
+    if sys.stdout.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb":
+        return "\033[2m" + str(value) + "\033[0m"
+    return str(value)
+
+
+def ui(message=""):
+    print(dim("│") + ("  " + str(message) if message else ""), flush=True)
+
+
+def intro():
+    print("\n" + highlight("┌") + "  " + highlight("unode " + VERSION), flush=True)
+
+
+def section(title):
+    # Clack-inspired guide: whitespace in the gutter separates short step titles.
+    ui()
+    print(highlight("◇") + "  " + highlight(title), flush=True)
+    ui()
+
+
+def outro(message):
+    ui()
+    print(highlight("└") + "  " + message + "\n", flush=True)
+
+
+def confirm(message, default=True):
+    if not interactive():
+        raise UnodeError("此操作需要交互终端；只检查请使用 --check")
+    suffix = "[Y/n] " if default else "[y/N] "
+    while True:
+        answer = input(dim("│") + "  " + message + suffix).strip().lower()
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        ui("请输入 y 或 n。")
+
+
+def radio(message, items, default=0, with_title=True):
+    """Arrow keys select one radio item; Enter accepts the focused item."""
+    if not interactive():
+        raise UnodeError("单选菜单需要交互终端；可用 --m 和目标版本预选，再加 --check 查看计划")
+    fd = sys.stdin.fileno()
+    settings = termios.tcgetattr(fd)
+    focus = default
+    lines = len(items) + 1 + int(with_title)
+
+    def draw(first=False):
+        if not first:
+            sys.stdout.write("\x1b[{}A".format(lines))
+        if with_title:
+            sys.stdout.write("\r\x1b[2K" + dim("│") + "  " + message + "\n")
+        for index, label in enumerate(items):
+            mark = "◉" if index == focus else "○"
+            line = "{} {}".format(mark, label)
+            sys.stdout.write("\r\x1b[2K" + dim("│") + "  " + line + "\n")
+        sys.stdout.write("\r\x1b[2K" + dim("│  ↑↓ 切换 · Enter 确认 · 空格选择 · q 取消") + "\n")
+        sys.stdout.flush()
+
+    try:
+        tty.setcbreak(fd)
+        sys.stdout.write("\x1b[?25l")
+        draw(True)
+        while True:
+            key = os.read(fd, 1)
+            if key == b"\x1b":
+                if select.select([fd], [], [], 0.1)[0]:
+                    key += os.read(fd, 1)
+                    if select.select([fd], [], [], 0.1)[0]:
+                        key += os.read(fd, 1)
+                if key in (b"\x1b[A", b"\x1bOA"):
+                    focus = (focus - 1) % len(items)
+                elif key in (b"\x1b[B", b"\x1bOB"):
+                    focus = (focus + 1) % len(items)
+                else:
+                    raise KeyboardInterrupt
+            elif key in (b"k", b"j"):
+                focus = (focus + (1 if key == b"j" else -1)) % len(items)
+            elif key == b" ":
+                pass
+            elif key in (b"\r", b"\n"):
+                # Collapse completed menus to a single answer, preserving history
+                # without leaving the entire option list between later steps.
+                sys.stdout.write("\x1b[{}A".format(lines))
+                for _ in range(lines):
+                    sys.stdout.write("\r\x1b[2K\n")
+                sys.stdout.write("\x1b[{}A\r".format(lines))
+                ui(highlight(items[focus]))
+                return focus
+            elif key in (b"q", b"\x03", b"\x04"):
+                raise KeyboardInterrupt
+            draw()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, settings)
+        sys.stdout.write("\x1b[?25h")
+        sys.stdout.flush()
+
+
+def version_tuple(value):
+    found = EXACT.fullmatch(value)
+    if not found:
+        raise UnodeError("不是明确的 Node 版本：" + value)
+    return tuple(int(x) for x in found.groups())
+
+
+def matches(value, selector):
+    wanted = selector.lstrip("v").split(".")
+    return value.lstrip("v").split(".")[:len(wanted)] == wanted
+
+
+def versions():
+    try:
+        with urllib.request.urlopen(NODE_INDEX, timeout=20) as response:
+            data = json.loads(response.read(8 * 1024 * 1024))
+        if not isinstance(data, list):
+            raise ValueError("unexpected index")
+        return sorted([item for item in data if isinstance(item, dict) and EXACT.fullmatch(str(item.get("version", "")))],
+                      key=lambda item: version_tuple(item["version"]), reverse=True)
+    except (OSError, ValueError) as exc:
+        raise UnodeError("无法读取 Node 官方版本列表；可以指定完整版本离线检查：" + str(exc))
+
+
+def resolve_version(selector, index=None):
+    if EXACT.fullmatch(selector):
+        return selector.lstrip("v")
+    if selector not in ("lts", "latest") and not SELECTOR.fullmatch(selector):
+        raise UnodeError("版本仅支持数字版本、lts、latest")
+    for item in versions() if index is None else index:
+        if selector == "latest" or (selector == "lts" and item.get("lts")) or (SELECTOR.fullmatch(selector) and matches(item["version"], selector)):
+            return item["version"].lstrip("v")
+    raise UnodeError("找不到目标 Node 版本：" + selector)
+
+
+def node_info(binary, check=True):
+    if not binary:
+        return None
+    result = run([binary, "-p", NODE_INFO], check=check)
+    if result.returncode:
+        return None
+    try:
+        data = json.loads(result.stdout)
+        version_tuple(data["version"])
+        data["path"] = str(Path(data["path"]).resolve(strict=True))
+        return data
+    except (ValueError, KeyError, OSError) as exc:
+        raise UnodeError("无法识别 Node：{}（{}）".format(binary, exc))
+
+
+def node_env(node):
+    env = dict(os.environ)
+    env["PATH"] = str(Path(node).parent) + os.pathsep + env.get("PATH", "")
+    # PM2 reports $_ as "node path"; subprocess does not refresh it for us.
+    env["_"] = str(node)
+    if Path(node).parent.parent.parent.name == "node" and Path(node).parent.parent.parent.parent.name == "versions":
+        env["NVM_BIN"] = str(Path(node).parent)
+        env["NVM_INC"] = str(Path(node).parent.parent / "include/node")
+    # Avoid invoking arbitrary shell profiles when loading the chosen manager.
+    env.pop("BASH_ENV", None)
+    env.pop("ENV", None)
+    return env
+
+
+def npm_cli(node):
+    candidate = Path(node).parent / "npm"
+    if not candidate.exists():
+        raise UnodeError("目标 Node 旁未找到 npm；请先为该环境安装 npm：" + str(candidate))
+    target = candidate.resolve()
+    if target.name != "npm-cli.js":
+        raise UnodeError("npm 是自定义包装器，无法确保使用目标 Node：" + str(candidate))
+    return target
+
+
+def npm(node, arguments, **kwargs):
+    return run([node, npm_cli(node), *arguments], env=node_env(node), **kwargs)
+
+
+def pm2_package(node, explicit=None):
+    if explicit:
+        candidate = explicit.expanduser().resolve()
+    else:
+        if not node:
+            return None
+        try:
+            root = npm(node, ["root", "-g"]).stdout.strip()
+        except UnodeError:
+            return None
+        if not os.path.isabs(root):
+            raise UnodeError("npm 返回的全局包目录不是绝对路径")
+        candidate = Path(root) / "pm2"
+    if not (candidate / "package.json").exists():
+        if explicit:
+            raise UnodeError("指定位置没有 PM2 包：" + str(candidate))
+        return None
+    try:
+        package = json.loads((candidate / "package.json").read_text())
+    except (ValueError, OSError) as exc:
+        raise UnodeError("PM2 package.json 无法读取：" + str(exc))
+    if package.get("name") != "pm2" or not (candidate / "bin/pm2").is_file():
+        raise UnodeError("无效的 PM2 包：" + str(candidate))
+    return {"dir": str(candidate.resolve()), "version": package["version"]}
+
+
+def daemon_pid(home):
+    pid_file = home / "pm2.pid"
+    if not pid_file.exists():
+        return None
+    if pid_file.stat().st_uid != os.getuid():
+        raise UnodeError("PM2 属于其他用户，请用原服务用户运行")
+    try:
+        pid = int(pid_file.read_text().strip())
+        if pid <= 1:
+            raise ValueError("invalid PID")
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except (ValueError, PermissionError) as exc:
+        raise UnodeError("PM2 PID 无法核实：" + str(exc))
+    if not (home / "rpc.sock").exists():
+        raise UnodeError("PM2 PID 存在但 RPC socket 缺失；请先检查后台状态")
+    return pid
+
+
+def pm2_snapshot(node, package, home):
+    if not daemon_pid(home):
+        return None
+    if not package:
+        raise UnodeError("PM2 后台正在运行，但找不到原 PM2 包；请通过 --pm2-dir 指定")
+    result = run([node, HELPER, "--internal-snapshot", package["dir"], home], env={**node_env(node), "PM2_HOME": str(home)}, timeout=20)
+    marker = "PM2_NODE_SNAPSHOT:"
+    lines = [line[len(marker):] for line in result.stdout.splitlines() if line.startswith(marker)]
+    try:
+        data = json.loads(lines[-1])
+        if data["report"]["uid"] != os.getuid() or not isinstance(data["apps"], list):
+            raise ValueError("user/list mismatch")
+        version_tuple(data["report"]["node_version"])
+        return data
+    except (ValueError, IndexError, KeyError) as exc:
+        raise UnodeError("无法可靠读取 PM2 后台报告，不执行迁移：" + str(exc))
+
+
+def verify_original_apps(before, after, target_version):
+    if not after:
+        raise UnodeError("PM2 后台在迁移后没有响应")
+    def identity(app):
+        env = app["pm2_env"]
+        instance_var = env.get("instance_var") or "NODE_APP_INSTANCE"
+        instance = env.get(instance_var, env.get("env", {}).get(instance_var))
+        instance = str(instance) if instance is not None else None
+        return (env.get("namespace", "default"), env.get("name"), env.get("pm_exec_path"), env.get("pm_cwd"), env.get("exec_mode"), instance)
+    if Counter(identity(app) for app in before["apps"]) != Counter(identity(app) for app in after["apps"]):
+        raise UnodeError("应用实例与 Node 变更前的原始进程表不一致")
+    if after["report"]["node_version"].lstrip("v") != target_version:
+        raise UnodeError("PM2 后台 Node 版本不符")
+    expected_states = Counter((identity(app), app["pm2_env"].get("status")) for app in before["apps"])
+    actual_states = Counter((identity(app), app["pm2_env"].get("status")) for app in after["apps"])
+    if expected_states != actual_states:
+        raise UnodeError("应用运行/停止状态与变更前不一致，原来停止的应用必须保持停止")
+    for app in after["apps"]:
+        env = app["pm2_env"]
+        if env.get("status") == "stopped":
+            if app.get("pid"):
+                raise UnodeError("已停止应用仍有运行中的 PID：" + str(app.get("name")))
+            continue
+        if env.get("status") != "online" or not app.get("pid"):
+            raise UnodeError("应用没有恢复在线：" + str(app.get("name")))
+        if env.get("exec_mode") == "cluster_mode" and env.get("node_version", "").lstrip("v") != target_version:
+            raise UnodeError("cluster 实例 Node 版本不符：" + str(app.get("name")))
+
+
+def check_original_apps(snapshot):
+    if not snapshot:
+        return
+    if not snapshot["apps"]:
+        raise UnodeError("PM2 进程表为空，不执行迁移；如只升级 Node，请选择不处理 PM2")
+    bad = ["{}（{}）".format(app.get("name", "?"), app["pm2_env"].get("status")) for app in snapshot["apps"] if app["pm2_env"].get("status") not in ("online", "stopped")]
+    if bad:
+        raise UnodeError("存在异常或过渡状态的应用，请先处理：" + ", ".join(bad))
+    modules = [app.get("name", "?") for app in snapshot["apps"] if app["pm2_env"].get("status") == "stopped" and app["pm2_env"].get("pmx_module")]
+    if modules:
+        raise UnodeError("已停止的 PM2 插件不能按普通应用迁移，原生 update 会自动加载插件；未执行更改：" + ", ".join(modules))
+
+
+class State:
+    def __init__(self, home=None, config=None):
+        self.home = Path(home or os.environ.get("UNODE_HOME", str(Path.home() / ".unode"))).expanduser().absolute()
+        installed_path = Path(__file__).resolve().with_name("config-path")
+        configured = config or os.environ.get("UNODE_CONFIG")
+        if not configured:
+            configured = installed_path.read_text().strip() if installed_path.exists() else "/etc/unode/config.json"
+        self.config_file = Path(configured).expanduser().absolute()
+        self.folder = None
+        self.record = {}
+
+    def config(self):
+        file = self.config_file
+        if not file.exists():
+            return {"schema": 1, "manager": "nvm", "settle_seconds": 30}
+        try:
+            result = json.loads(file.read_text())
+            if not isinstance(result, dict):
+                raise ValueError("configuration must be a JSON object")
+            if result.get("schema") != 1 or result.get("manager", "nvm") not in ("nvm", "fnm", "n", "system", "path"):
+                raise ValueError("unsupported config")
+            settle = result.get("settle_seconds", 30)
+            if not isinstance(settle, int) or isinstance(settle, bool) or not 3 <= settle <= 3600:
+                raise ValueError("settle_seconds must be 3..3600")
+            if result.get("nvm_dir") is not None and not isinstance(result["nvm_dir"], str):
+                raise ValueError("nvm_dir must be a path template")
+            return {"schema": 1, "manager": "nvm", "settle_seconds": 30, **result}
+        except (ValueError, OSError) as exc:
+            raise UnodeError("配置无法读取：{}（{}）".format(file, exc))
+
+    def private_dir(self, directory):
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if directory.is_symlink() or directory.stat().st_uid != os.getuid():
+            raise UnodeError("运行数据目录不能是符号链接或其他用户的目录：" + str(directory))
+        directory.chmod(0o700)
+
+    def write(self, file, data):
+        self.private_dir(file.parent)
+        fd, stage = tempfile.mkstemp(prefix=".unode-", dir=str(file.parent))
+        try:
+            os.fchmod(fd, 0o600)
+            content = data if isinstance(data, (str, bytes)) else json.dumps(data, ensure_ascii=False, indent=2)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(content.encode("utf-8") if isinstance(content, str) else content)
+            os.replace(stage, file)
+        finally:
+            if os.path.exists(stage):
+                os.unlink(stage)
+
+    def start(self, plan):
+        self.private_dir(self.home)
+        parent = self.home / "backups"
+        self.private_dir(parent)
+        self.folder = Path(tempfile.mkdtemp(prefix=datetime.now().strftime("%Y%m%d-%H%M%S-"), dir=str(parent)))
+        self.folder.chmod(0o700)
+        self.record = {"schema": 1, "started_at": datetime.now(timezone.utc).isoformat(), "status": "running", "plan": plan, "backup": str(self.folder)}
+        self.write(self.folder / "plan.json", self.record)
+        return self.folder
+
+    def finish(self, status, **fields):
+        self.record.update(status=status, finished_at=datetime.now(timezone.utc).isoformat(), **fields)
+        self.write(self.folder / "result.json", self.record)
+        self.write(self.home / "last-run.json", self.record)
+
+
+@contextmanager
+def lock_file(file):
+    file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(str(file), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if os.fstat(fd).st_uid != os.getuid():
+            raise UnodeError("锁文件属于其他用户：" + str(file))
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise UnodeError("另一个 unode 正在执行：" + str(file))
+        yield
+    finally:
+        os.close(fd)
+
+
+class Manager:
+    def __init__(self, name, state):
+        self.name = name
+        self.state = state
+        self.config = state.config()
+        nvm_dir = os.environ.get("NVM_DIR") or self.config.get("nvm_dir") or str(Path.home() / ".nvm")
+        self.nvm_dir = Path(os.path.expandvars(nvm_dir)).expanduser().absolute()
+        self.nvm_script = self.nvm_dir / "nvm.sh"
+        if not self.nvm_script.exists() and "NVM_DIR" not in os.environ and not self.config.get("nvm_dir"):
+            xdg = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "nvm"
+            if (xdg / "nvm.sh").exists():
+                self.nvm_dir, self.nvm_script = xdg, xdg / "nvm.sh"
+
+    def available(self):
+        if self.name == "nvm":
+            return self.nvm_script.is_file()
+        if self.name == "path":
+            return True
+        if self.name == "system":
+            return bool(self.system_tool())
+        return bool(shutil.which(self.name))
+
+    def system_tool(self):
+        for tool in (["brew"] if platform.system() == "Darwin" else ["apt-get", "dnf"]):
+            if shutil.which(tool):
+                return tool
+        return None
+
+    def nvm(self, args, check=True, timeout=60):
+        if not self.nvm_script.exists():
+            if check:
+                raise UnodeError("未安装 nvm")
+            return subprocess.CompletedProcess(args, 1, "", "nvm missing")
+        script = 'source "$1" --no-use; shift; nvm "$@"'
+        env = dict(os.environ)
+        env.update(NVM_DIR=str(self.nvm_dir), NVM_NO_COLORS="1")
+        env.pop("BASH_ENV", None)
+        env.pop("ENV", None)
+        return run(["bash", "--noprofile", "--norc", "-c", script, "unode", self.nvm_script, *args], env=env, check=check, timeout=timeout,
+                   log=self.state.folder / "manager.log" if self.state.folder else None)
+
+    def bootstrap_nvm(self):
+        if self.nvm_script.exists():
+            return
+        if not shutil.which("curl") and not shutil.which("wget"):
+            raise UnodeError("安装 nvm 需要 curl 或 wget；可重新运行 install.sh 安装缺失依赖")
+        url = "https://raw.githubusercontent.com/nvm-sh/nvm/{}/install.sh".format(NVM_RELEASE)
+        with urllib.request.urlopen(url, timeout=30) as response:
+            script = response.read(2 * 1024 * 1024).decode("utf-8")
+        installer = self.state.folder / "nvm-install.sh"
+        self.state.write(installer, script)
+        env = dict(os.environ, PROFILE="/dev/null", NVM_DIR=str(self.nvm_dir))
+        print("安装 nvm {} 到 {}；不自动修改 shell 配置。".format(NVM_RELEASE, self.nvm_dir))
+        run(["bash", installer], env=env, timeout=300, log=self.state.folder / "manager.log")
+        if not self.nvm_script.is_file():
+            raise UnodeError("nvm 安装后仍未找到 nvm.sh")
+
+    def installed(self, version):
+        if not self.available():
+            return None
+        if self.name == "nvm":
+            result = self.nvm(["which", version], check=False)
+            if not result.returncode:
+                return node_info(result.stdout.strip().splitlines()[-1])
+        elif self.name == "fnm":
+            result = run(["fnm", "exec", "--using", version, "node", "-p", NODE_INFO], check=False)
+            if not result.returncode:
+                try:
+                    data = json.loads(result.stdout.strip().splitlines()[-1])
+                    return node_info(data["path"])
+                except (ValueError, KeyError, IndexError):
+                    return None
+        elif self.name == "n":
+            binary = Path(os.environ.get("N_PREFIX", "/usr/local")) / "bin/node"
+            if binary.exists():
+                data = node_info(binary)
+                if data["version"] == version:
+                    return data
+        elif self.name == "system":
+            if self.system_tool() == "brew":
+                formula = "node@" + version.split(".")[0]
+                result = run(["brew", "--prefix", formula], check=False)
+                binary = Path(result.stdout.strip()) / "bin/node"
+            else:
+                binary = Path("/usr/bin/node")
+            if binary.exists():
+                data = node_info(binary)
+                if data["version"] == version:
+                    return data
+        return None
+
+    def system_target(self, selector):
+        tool = self.system_tool()
+        if not tool:
+            raise UnodeError("找不到受支持的系统包管理器（brew/apt/dnf）")
+        wanted = str(version_tuple(resolve_version(selector))[0]) if selector in ("lts", "latest") else selector.lstrip("v")
+        if tool == "brew":
+            formula = "node@" + wanted.split(".")[0]
+            result = run(["brew", "info", "--json=v2", "--formula", formula])
+            try:
+                data = json.loads(result.stdout)["formulae"][0]
+                version = data["versions"]["stable"]
+            except (ValueError, KeyError, IndexError):
+                raise UnodeError("无法读取 Homebrew Node 配方")
+            if not matches(version, wanted):
+                raise UnodeError("该 Homebrew 配方只能提供 {}，与 {} 不符".format(version, wanted))
+            return version, {"tool": tool, "package": formula}
+        if tool == "apt-get":
+            result = run(["apt-cache", "madison", "nodejs"])
+            rows = []
+            for line in result.stdout.splitlines():
+                fields = line.split("|")
+                if len(fields) >= 2:
+                    package = fields[1].strip()
+                    found = re.match(r"(?:\d+:)?(\d+\.\d+\.\d+)", package)
+                    if found and matches(found[1], wanted):
+                        rows.append((found[1], package))
+        else:
+            result = run(["dnf", "-q", "repoquery", "--available", "--qf", "%{version}|%{nevra}", "nodejs"])
+            rows = []
+            for line in result.stdout.splitlines():
+                fields = line.split("|", 1)
+                if len(fields) == 2 and EXACT.fullmatch(fields[0]) and matches(fields[0], wanted):
+                    rows.append((fields[0], fields[1]))
+        if not rows:
+            raise UnodeError("当前系统软件源不提供 Node {}；可选择 nvm，unode 不自动添加或替换系统软件源".format(wanted))
+        version, package = max(rows, key=lambda row: version_tuple(row[0]))
+        return version, {"tool": tool, "package": package}
+
+    def install(self, version, metadata=None):
+        print("准备目标 Node {}，方式：{}…".format(version, self.name), flush=True)
+        if self.name == "nvm":
+            self.bootstrap_nvm()
+            arguments = ["install", version]
+            if metadata and metadata.get("reinstall_from"):
+                arguments.append("--reinstall-packages-from=" + metadata["reinstall_from"])
+            self.nvm(arguments, timeout=1800)
+        elif self.name == "fnm":
+            run(["fnm", "install", version], timeout=1800, log=self.state.folder / "manager.log")
+        elif self.name == "n":
+            run(["n", version], timeout=1800, log=self.state.folder / "manager.log")
+        elif self.name == "system":
+            tool, package = metadata["tool"], metadata["package"]
+            if tool == "brew":
+                exists = run(["brew", "list", "--versions", package], check=False).stdout.strip()
+                command = ["brew", "upgrade" if exists else "install", package]
+            else:
+                command = ["apt-get", "install", "-y", "nodejs=" + package] if tool == "apt-get" else ["dnf", "install", "-y", package]
+                if os.getuid() != 0:
+                    if not shutil.which("sudo"):
+                        raise UnodeError("安装系统 Node 需要 sudo；请先配置管理员权限")
+                    command.insert(0, "sudo")
+            run(command, timeout=1800, log=self.state.folder / "manager.log")
+        else:
+            raise UnodeError("path 模式不执行安装")
+        installed = self.installed(version)
+        if not installed or installed["version"] != version:
+            raise UnodeError("安装结果与明确的目标版本不符；停止后续处理")
+        return installed
+
+    def set_default(self, version):
+        if self.name == "nvm":
+            self.nvm(["alias", "default", version])
+        elif self.name == "fnm":
+            run(["fnm", "default", version], log=self.state.folder / "manager.log")
+
+
+def select_manager(args, state):
+    names = ["nvm", "fnm", "n", "system", "path"]
+    labels = ["nvm（默认）", "fnm", "n", "系统包管理器（brew / apt / dnf）", "使用已有 Node 路径"]
+    if args.m:
+        manager = Manager(args.m, state)
+    elif args.check:
+        manager = Manager(state.config().get("manager", "nvm"), state)
+    else:
+        manager = Manager(names[radio("Node 管理方式", labels, names.index(state.config().get("manager", "nvm")), with_title=False)], state)
+    if not manager.available() and manager.name != "nvm":
+        raise UnodeError("所选管理工具尚未安装，请先安装或重新选择：" + manager.name)
+    return manager
+
+
+def select_version(args):
+    if args.version:
+        return args.version
+    if args.check:
+        return "lts"
+    index = versions()
+    majors = []
+    for item in index:
+        major = version_tuple(item["version"])[0]
+        if item.get("lts") and major not in majors:
+            majors.append(major)
+        if len(majors) == 3:
+            break
+    labels = ["最新 LTS（推荐）", "最新发布版"] + ["Node {} 系列最新补丁".format(m) for m in majors] + ["输入具体版本"]
+    selected = radio("目标 Node 版本", labels, with_title=False)
+    values = ["lts", "latest"] + [str(m) for m in majors]
+    return input(dim("│") + "  输入 Node 版本（如 22、22.20.0）：").strip() if selected == len(values) else values[selected]
+
+
+def choose_pm2(args):
+    if args.pm2:
+        return True
+    # In check mode do not touch PM2 unless explicitly selected with --pm2.
+    if args.check:
+        return False
+    return confirm("是否处理 PM2？回答 n 跳过 PM2 迁移；完成后仍校验启动 Node。", default=True)
+
+
+def health_check(url):
+    if not url:
+        return False
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            if not 200 <= response.status < 300:
+                raise UnodeError("业务健康检查未通过：HTTP " + str(response.status))
+    except (urllib.error.URLError, OSError) as exc:
+        raise UnodeError("业务健康检查失败：" + str(exc))
+    print("✓ 业务健康检查通过（HTTP 2xx）")
+    return True
+
+
+def show_parser():
+    cli = argparse.ArgumentParser(prog="unode show", description="查看现有配置和状态。")
+    commands = cli.add_subparsers(dest="topic", required=True)
+    startup = commands.add_parser("startup", help="查看 PM2 启动配置和服务状态（macOS / Linux systemd）")
+    startup.add_argument("--service", help="systemd 服务名，或 macOS LaunchAgent 文件名（可省略扩展名）")
+    return cli
+
+
+def launchagent_config(service=None):
+    name = service or "pm2." + pwd.getpwuid(os.getuid()).pw_name
+    if name.endswith(".plist"):
+        name = name[:-6]
+    if not re.fullmatch(r"[A-Za-z0-9_.@:-]+", name) or name in (".", ".."):
+        raise UnodeError("无效的 LaunchAgent 文件名")
+    file = Path.home() / "Library/LaunchAgents" / (name + ".plist")
+    content = file.read_bytes()
+    try:
+        config = plistlib.loads(content)
+    except (ValueError, TypeError, OverflowError, plistlib.InvalidFileException, ExpatError) as exc:
+        raise UnodeError("无法解析启动配置：{}（{}）".format(file, exc))
+    label = config.get("Label") if isinstance(config, dict) else None
+    if not isinstance(label, str) or not label or "/" in label:
+        raise UnodeError("启动配置缺少有效的 launchd Label：" + str(file))
+    return file, config
+
+
+def startup_unit(service=None):
+    unit = service or "pm2-" + pwd.getpwuid(os.getuid()).pw_name
+    if not unit.endswith(".service"):
+        unit += ".service"
+    if not re.fullmatch(r"[A-Za-z0-9_.@:-]+\.service", unit):
+        raise UnodeError("无效的服务名称")
+    return unit
+
+
+def startup_node_binary(arguments, environment):
+    """Resolve common PM2 launch commands without executing a shell or PM2."""
+    if not isinstance(arguments, list) or not arguments or not all(isinstance(a, str) for a in arguments):
+        raise UnodeError("启动命令无法解析")
+    if arguments[0] in ("/bin/sh", "/bin/bash", "/bin/zsh"):
+        if len(arguments) != 3 or arguments[1] != "-c" or re.search(r"[$`;|&<>\n]", arguments[2]):
+            raise UnodeError("自定义 shell 启动命令需人工复核")
+        arguments = shlex.split(arguments[2])
+        if not arguments:
+            raise UnodeError("启动命令为空")
+
+    def locate(name):
+        if name.startswith("/"):
+            return name
+        # Relative PATH components depend on the service's working directory.
+        path = environment.get("PATH", "")
+        if "/" in name or not path or any(not p.startswith("/") for p in path.split(os.pathsep)):
+            raise UnodeError("启动配置缺少可确定的绝对 PATH")
+        found = shutil.which(name, path=path)
+        if not found:
+            raise UnodeError("启动配置 PATH 找不到 " + name)
+        return found
+
+    executable = locate(arguments[0])
+    if Path(executable).name == "node":
+        return executable
+    if Path(executable).name != "pm2":
+        raise UnodeError("无法识别自定义启动程序：" + executable)
+    with open(executable, "rb") as source:
+        shebang = source.readline(4096).decode("utf-8").strip()
+    if not shebang.startswith("#!"):
+        raise UnodeError("PM2 启动文件缺少可识别的 Node shebang")
+    interpreter = shlex.split(shebang[2:])
+    if interpreter[:1] == ["/usr/bin/env"]:
+        interpreter = interpreter[1:]
+        if interpreter[:1] == ["-S"]:
+            interpreter = interpreter[1:]
+    if not interpreter or Path(interpreter[0]).name != "node":
+        raise UnodeError("PM2 启动文件使用了无法识别的解释器")
+    return locate(interpreter[0])
+
+
+def startup_node_check(target=None, service=None):
+    """Check the configured startup Node, independently of the running PM2 daemon."""
+    try:
+        if platform.system() == "Darwin":
+            file, config = launchagent_config(service)
+            source = str(file)
+            environment = config.get("EnvironmentVariables", {})
+            arguments = config.get("ProgramArguments", [])
+            if config.get("Program"):
+                arguments = [config["Program"]]
+        elif platform.system() == "Linux" and shutil.which("systemctl"):
+            unit = startup_unit(service)
+            result = run(["systemctl", "show", unit, "--property=LoadState", "--property=Environment",
+                          "--property=EnvironmentFiles", "--property=ExecStart", "--property=NeedDaemonReload"], check=False)
+            config = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+            if config.get("LoadState") == "not-found":
+                return {"status": "not-configured", "details": "未找到启动服务 " + unit + "；自定义名称请使用 --service"}
+            if result.returncode:
+                raise UnodeError("systemd 启动配置查询失败：" + (result.stderr or result.stdout).strip())
+            if config.get("NeedDaemonReload") == "yes":
+                raise UnodeError("服务文件已修改但尚未 daemon-reload，无法确认磁盘上的启动 Node")
+            if config.get("LoadState") != "loaded" or config.get("EnvironmentFiles"):
+                raise UnodeError("服务未加载或使用了 EnvironmentFile，启动环境需人工复核")
+            environment = dict(item.split("=", 1) for item in shlex.split(config.get("Environment", "")) if "=" in item)
+            executables = re.findall(r"(?:^|[ {])path=(.*?)\s*;", config.get("ExecStart", ""))
+            if len(executables) != 1:
+                raise UnodeError("无法确定 systemd ExecStart 可执行文件")
+            arguments, source = executables, unit
+        else:
+            raise UnodeError("当前系统的启动 Node 检查需要 macOS launchd 或 Linux systemd")
+        if not isinstance(environment, dict) or not all(isinstance(v, str) for v in environment.values()):
+            raise UnodeError("启动环境变量格式异常")
+        binary = startup_node_binary(arguments, environment)
+        node = node_info(binary, check=False)
+        if not node:
+            raise UnodeError("启动配置中的 Node 不可执行或版本不可读：" + binary)
+        return {"status": ("match" if node["version"] == target["version"] else "mismatch") if target else "inspected",
+                "node": node, "source": source, "target": target}
+    except FileNotFoundError as exc:
+        # Missing plist means startup is unconfigured; missing interpreter means broken config.
+        if str(exc.filename).endswith(".plist"):
+            return {"status": "not-configured", "details": "未找到启动配置：" + str(exc.filename) + "；自定义名称请使用 --service"}
+        return {"status": "manual", "details": str(exc)}
+    except (UnodeError, OSError, ValueError, TypeError, UnicodeError) as exc:
+        return {"status": "manual", "details": str(exc)}
+
+
+def display_startup_node(result, target=None, reference="本次目标"):
+    print(flush=True)
+    section("启动配置 Node 版本")
+    if result.get("source"):
+        ui("启动配置：" + result["source"])
+    if target:
+        ui(reference + " Node：" + highlight(target["version"]))
+    if result.get("node"):
+        ui("启动配置 Node：" + highlight(result["node"]["version"]))
+        ui("启动 Node 路径：" + result["node"]["path"])
+    if result["status"] == "match":
+        ui(highlight("✓ 启动 Node 版本与" + reference + "一致", "32"))
+    elif result["status"] == "mismatch":
+        ui(highlight("! 启动 Node 版本与" + reference + "不一致", "31"))
+    elif result["status"] != "inspected":
+        ui(highlight("! 启动 Node 未验证：" + result["details"], "33"))
+    else:
+        ui(highlight("! 未找到可比较的目标版本，仅显示启动 Node", "33"))
+
+
+def startup_reference():
+    """Prefer the last completed target; the shell may still use an older Node."""
+    file = Path(os.environ.get("UNODE_HOME", str(Path.home() / ".unode"))).expanduser() / "last-run.json"
+    try:
+        record = json.loads(file.read_text())
+        if isinstance(record, dict) and (record.get("status") in ("passed", "passed-with-pending-startup") or record.get("node_verified") is True):
+            target = record.get("target")
+            if isinstance(target, dict) and isinstance(target.get("version"), str) and EXACT.fullmatch(target["version"]):
+                return {**target, "version": target["version"].lstrip("v")}, "最近安装目标"
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as exc:
+        ui("! 最近安装记录无法读取：" + str(exc))
+    binary = shutil.which("node")
+    if binary:
+        try:
+            node = node_info(binary, check=False)
+            if node:
+                return node, "当前终端"
+        except (UnodeError, OSError, ValueError) as exc:
+            ui("! 当前终端 Node 无法读取：" + str(exc))
+    return None, "目标"
+
+
+def show_startup_node(service=None):
+    target, reference = startup_reference()
+    result = startup_node_check(target, service)
+    display_startup_node(result, target, reference)
+    return 2 if result["status"] in ("mismatch", "manual") else 0
+
+
+def show_startup(service=None):
+    """Inspect startup definitions without requiring Node, PM2, or a terminal."""
+    system = platform.system()
+    if system == "Darwin":
+        try:
+            file, config = launchagent_config(service)
+        except FileNotFoundError:
+            raise UnodeError("未找到启动配置；自定义名称请使用 --service")
+        label = config["Label"]
+        print("启动配置：" + str(file), flush=True)
+        # plistlib also handles binary plists; display them as readable XML.
+        print(plistlib.dumps(config, sort_keys=False).decode("utf-8"), end="", flush=True)
+        exit_code = show_startup_node(service)
+        print("\n服务状态（Label={}）：".format(label), flush=True)
+        failures = []
+        for domain in ("gui/{}".format(os.getuid()), "user/{}".format(os.getuid()), "system"):
+            result = run(["launchctl", "print", domain + "/" + label], check=False)
+            if result.returncode == 0:
+                print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+                return exit_code
+            failures.append("{}：{}".format(domain, (result.stderr or result.stdout).strip()))
+        print("未能读取已加载的服务状态（可能尚未加载或当前会话无权查询）。")
+        for failure in failures:
+            print("  " + failure)
+        return exit_code
+    if system == "Linux":
+        if not shutil.which("systemctl"):
+            raise UnodeError("未检测到 systemctl；show startup 的 Linux 支持需要 systemd")
+        unit = startup_unit(service)
+        print("启动配置：" + unit, flush=True)
+        result = run(["systemctl", "--no-pager", "cat", "--", unit])
+        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n", flush=True)
+        exit_code = show_startup_node(service)
+        print("\n服务状态：", flush=True)
+        result = run(["systemctl", "--no-pager", "--full", "status", "--", unit], check=False)
+        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+        if result.stderr:
+            print(result.stderr, file=sys.stderr, end="" if result.stderr.endswith("\n") else "\n")
+        # systemctl status returns 3 for an inactive/failed service.
+        if result.returncode not in (0, 3):
+            raise UnodeError("无法读取 systemd 服务状态（退出码 {}）".format(result.returncode))
+        return exit_code
+    raise UnodeError("目前支持 macOS 和 Linux")
+
+
+def startup_check(home, target, service=None):
+    """Read OS state without invoking PM2 CLI or starting/restarting anything."""
+    if platform.system() != "Linux" or not shutil.which("systemctl"):
+        if platform.system() == "Darwin":
+            files = list((Path.home() / "Library/LaunchAgents").glob("*pm2*.plist"))
+            return {"status": "manual", "details": "macOS launchd 用户会话配置需人工复核", "files": [str(p) for p in files]}
+        return {"status": "manual", "details": "未检测到 systemd；需按实际 init 系统检查"}
+    username = pwd.getpwuid(os.getuid()).pw_name
+    unit = service or "pm2-{}.service".format(username)
+    if not unit.endswith(".service"):
+        unit += ".service"
+    if not re.fullmatch(r"[A-Za-z0-9_.@:-]+\.service", unit):
+        raise UnodeError("无效的服务名称")
+    fields = ["LoadState", "UnitFileState", "ActiveState", "User", "Environment", "ExecStart", "ExecStop", "PIDFile", "MainPID", "NeedDaemonReload", "FragmentPath", "DropInPaths"]
+    result = run(["systemctl", "show", unit, *["--property=" + key for key in fields]], check=False)
+    if result.returncode:
+        return {"status": "manual", "unit": unit, "details": "systemd 查询失败；未认定开机启动配置通过"}
+    data = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    if data.get("LoadState") == "not-found":
+        return {"status": "not-configured", "unit": unit, "details": "未找到默认服务；如使用自定义服务请传入 --service"}
+    issues = []
+    if data.get("LoadState") != "loaded":
+        issues.append("服务配置未正常加载")
+    if data.get("UnitFileState") not in ("enabled", "enabled-runtime"):
+        issues.append("服务未持久启用开机启动")
+    if data.get("UnitFileState") == "enabled-runtime":
+        issues.append("服务仅临时启用，重启后不保留")
+    if data.get("User") != username:
+        issues.append("服务用户与当前用户不一致")
+    if data.get("NeedDaemonReload") == "yes":
+        issues.append("服务文件更新后尚未 daemon-reload")
+    if data.get("ActiveState") != "active":
+        issues.append("系统服务当前不是 active，已有 PM2 可能由终端手动启动")
+    if data.get("MainPID", "0") != str(daemon_pid(home) or 0):
+        issues.append("系统服务 MainPID 与此 PM2_HOME 的后台 PID 不一致")
+    try:
+        env = dict(item.split("=", 1) for item in shlex.split(data.get("Environment", "")) if "=" in item)
+    except ValueError:
+        env = {}
+        issues.append("无法解析服务环境")
+    if env.get("PM2_HOME") != str(home):
+        issues.append("PM2_HOME 与当前业务进程表不一致")
+    node = shutil.which("node", path=env.get("PATH", "")) if env.get("PATH") else None
+    if not node:
+        issues.append("服务 PATH 找不到 Node")
+    else:
+        info = node_info(node, check=False)
+        if not info or info["version"] != target["version"] or info["path"] != target["path"]:
+            issues.append("服务 PATH 对应的 Node 与目标不一致")
+    executable = re.search(r"(?:^|[ {])path=(.*?)\s*;", data.get("ExecStart", ""))
+    if not executable or not os.access(executable[1], os.X_OK):
+        issues.append("ExecStart 无法解析或不可执行，需人工检查")
+    if "resurrect" not in data.get("ExecStart", ""):
+        issues.append("启动动作未发现 resurrect，需人工复核自定义服务")
+    dump = home / "dump.pm2"
+    try:
+        saved = json.loads(dump.read_text())
+        if not isinstance(saved, list) or not saved:
+            raise ValueError("empty dump")
+        for app in saved:
+            if not isinstance(app, dict):
+                raise ValueError("invalid dump entry")
+            if app.get("pm_exec_path") and not Path(app["pm_exec_path"]).exists():
+                issues.append("保存的应用入口不存在：" + str(app.get("name", "?")))
+            if app.get("pm_cwd") and not Path(app["pm_cwd"]).is_dir():
+                issues.append("保存的应用工作目录不存在：" + str(app.get("name", "?")))
+            interpreter = app.get("exec_interpreter", "")
+            if interpreter.startswith("/") and not os.access(interpreter, os.X_OK):
+                issues.append("保存的解释器路径不可执行：" + str(app.get("name", "?")))
+    except (OSError, ValueError, TypeError, AttributeError):
+        issues.append("保存的 dump.pm2 不可读、为空或格式异常")
+    return {"status": "needs-review" if issues else "config-passed", "unit": unit, "issues": issues, "properties": data,
+            "details": "仅检查配置，不代表已验证机器重启"}
+
+
+def save_startup(state, home, target, package, service):
+    result = startup_check(home, target, service)
+    state.write(state.folder / "startup-check.json", result)
+    print("开机启动：" + result.get("details", result["status"]))
+    for issue in result.get("issues", []):
+        print("  ! " + issue)
+    if result["status"] == "config-passed":
+        print("✓ 开机启动配置检查通过（不执行服务或机器重启）")
+    env = "env PM2_HOME={} PATH={}".format(shlex.quote(str(home)), shlex.quote(node_env(target["path"])["PATH"]))
+    base = "{} {} {}".format(env, shlex.quote(target["path"]), shlex.quote(str(Path(package["dir"]) / "bin/pm2")))
+    username = pwd.getpwuid(os.getuid()).pw_name
+    service_name = service[:-8] if service and service.endswith(".service") else service
+    service_option = " --service-name " + shlex.quote(service_name) if service_name else ""
+    text = "以下是人工维护命令，不是可直接运行的脚本。\n"
+    text += "警告：unstartup 会停止服务，默认 ExecStop 为 pm2 kill，会中断应用。\n"
+    text += "自定义服务、drop-in、PM2_HOME 请先对照备份；不要覆盖未知配置。\n"
+    text += "按原用户执行，逐条审阅 PM2 打印的 sudo 命令；重建后需确认应用恢复。\n\n"
+    text += base + " unstartup" + service_option + "\n"
+    text += base + " startup -u " + shlex.quote(username) + service_option + "\n"
+    text += base + " resurrect\n" + base + " save\n"
+    state.write(state.folder / "startup-commands.txt", text)
+    return result
+
+
+def migrate_pm2(args, target, old_package, before, state):
+    node = target["path"]
+    package = pm2_package(node)
+    wanted = old_package["version"] if old_package else "latest"
+    if not package or (old_package and package["version"] != wanted):
+        print("在目标 Node 环境安装 PM2 {}…".format(wanted), flush=True)
+        npm(node, ["install", "--global", "pm2@" + wanted, "--ignore-scripts", "--no-fund", "--no-audit"], timeout=300, log=state.folder / "npm.log")
+        package = pm2_package(node)
+        if not package or (old_package and package["version"] != wanted):
+            raise UnodeError("目标环境的 PM2 软件版本不符合预期")
+    if before:
+        section("PM2 更新与验收")
+        command = [node, HELPER, "--pm2-dir", package["dir"], "--pm2-home", args.pm2_home,
+                   "--apply", "--backup-root", state.folder / "pm2", "--settle", str(args.settle), "--interactive-kill"]
+        if args.allow_kill:
+            command.append("--allow-kill")
+        # Inherit the terminal so the helper can ask about kill only if necessary.
+        result = subprocess.run([str(v) for v in command], env=node_env(node))
+        if result.returncode:
+            raise UnodeError("PM2 迁移或验收未通过；未自动回滚，请查看备份及诊断日志")
+        after = pm2_snapshot(node, package, args.pm2_home)
+        verify_original_apps(before, after, target["version"])
+        state.write(state.folder / "pm2-after.json", after)
+        if args.health_url:
+            section("业务健康检查")
+            health_check(args.health_url)
+        section("开机启动配置检查")
+        startup = save_startup(state, args.pm2_home, target, package, args.service)
+    else:
+        print("✓ PM2 软件包已就绪；没有原运行中的应用，不创建空后台、不执行 resurrect。")
+        if args.health_url:
+            health_check(args.health_url)
+        startup = {"status": "not-applicable", "details": "没有运行中的 PM2 应用"}
+    return package, startup
+
+
+def restartup_parser():
+    cli = argparse.ArgumentParser(prog="unode restartup", description="使用当前 Node 重建 PM2 开机启动配置，可能重启应用。")
+    cli.add_argument("--service", help="自定义 systemd 服务名或 LaunchAgent 文件名")
+    cli.add_argument("--pm2-home", type=Path, default=Path(os.environ.get("PM2_HOME", str(Path.home() / ".pm2"))))
+    cli.add_argument("--pm2-dir", type=Path, help="当前 Node 对应的 PM2 包目录")
+    cli.add_argument("--config", type=Path)
+    cli.add_argument("--settle", type=int, default=30, help="应用连续稳定观察秒数，默认 30")
+    cli.add_argument("--health-url")
+    cli.add_argument("--check", action="store_true", help="只显示计划和版本检查，不保存或重建")
+    return cli
+
+
+def launchd_jobs(label, file):
+    jobs = []
+    for domain in ("gui/{}".format(os.getuid()), "user/{}".format(os.getuid()), "system"):
+        job = domain + "/" + label
+        result = run(["launchctl", "print", job], check=False)
+        if not result.returncode:
+            # Refuse a same-label service belonging to a different plist/user.
+            origin = re.search(r"^\s*path = (.+)$", result.stdout, re.MULTILINE)
+            if not origin or Path(origin[1]).resolve() != file.resolve():
+                raise UnodeError("launchd Label 已被其他或无法核实的服务使用：" + job)
+            jobs.append(job)
+    return jobs
+
+
+def restartup_context(args, target):
+    for key in ("PM2_RPC_PORT", "PM2_PUB_PORT", "PM2_PID_FILE_PATH"):
+        if os.environ.get(key):
+            raise UnodeError("restartup 暂不支持自定义 " + key)
+    package = pm2_package(target["path"], args.pm2_dir)
+    if not package:
+        raise UnodeError("当前目标 Node 下未安装 PM2；请先安装 PM2")
+    username = pwd.getpwuid(os.getuid()).pw_name
+    env = node_env(target["path"])
+    env.update(HOME=str(Path.home()), USER=username, LOGNAME=username, PM2_HOME=str(args.pm2_home))
+    context = {"package": package, "env": env, "jobs": [], "exists": False}
+    if platform.system() == "Darwin":
+        name = args.service or "pm2." + username
+        if name.endswith(".plist"):
+            name = name[:-6]
+        if not re.fullmatch(r"[A-Za-z0-9_.@:-]+", name) or name in (".", ".."):
+            raise UnodeError("无效的 LaunchAgent 文件名")
+        file = Path.home() / "Library/LaunchAgents" / (name + ".plist")
+        if file.exists():
+            _, config = launchagent_config(name)
+            variables = config.get("EnvironmentVariables", {})
+            arguments = config.get("ProgramArguments", [])
+            if (config.get("UserName") != username or variables.get("PM2_HOME") != str(args.pm2_home)
+                    or config.get("Label") != "com.PM2" or "resurrect" not in " ".join(arguments)
+                    or config.get("Program") or len(arguments) != 3 or arguments[:2] != ["/bin/sh", "-c"]):
+                raise UnodeError("现有 LaunchAgent 不是此用户/PM2_HOME 的标准 PM2 配置，未覆盖")
+            command = shlex.split(arguments[2])
+            if (len(command) != 2 or command[1] != "resurrect" or Path(command[0]).name != "pm2"
+                    or re.search(r"[$`;|&<>\n]", arguments[2])):
+                raise UnodeError("现有 LaunchAgent 使用自定义启动命令，未覆盖")
+        context.update(platform="launchd", service=name, file=file, exists=file.exists(),
+                       jobs=launchd_jobs("com.PM2", file))
+    elif platform.system() == "Linux" and shutil.which("systemctl"):
+        unit = startup_unit(args.service)
+        result = run(["systemctl", "show", unit, "--property=LoadState", "--property=FragmentPath",
+                      "--property=DropInPaths", "--property=EnvironmentFiles", "--property=NeedDaemonReload", "--property=User", "--property=Environment", "--property=ExecStart"], check=False)
+        config = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        exists = config.get("LoadState") != "not-found"
+        file = Path("/etc/systemd/system") / unit
+        if config.get("NeedDaemonReload") == "yes" or (not exists and file.exists()):
+            raise UnodeError("磁盘上的服务配置尚未加载，需先复核并 daemon-reload，未覆盖")
+        if exists:
+            if result.returncode or config.get("LoadState") != "loaded":
+                raise UnodeError("无法读取现有 systemd 服务，未执行重建")
+            variables = dict(v.split("=", 1) for v in shlex.split(config.get("Environment", "")) if "=" in v)
+            if (config.get("FragmentPath") != str(file) or config.get("DropInPaths") or config.get("EnvironmentFiles")
+                    or config.get("User") != username or variables.get("PM2_HOME") != str(args.pm2_home)
+                    or "resurrect" not in config.get("ExecStart", "")):
+                raise UnodeError("现有 systemd 服务存在自定义配置/drop-in 或用户/PM2_HOME 不符，未覆盖")
+        context.update(platform="systemd", service=unit[:-8], unit=unit, file=file, exists=exists)
+    else:
+        raise UnodeError("restartup 支持 macOS launchd 和 Linux systemd")
+    # PM2's generator internally interpolates these into shell commands without quoting.
+    for value in (str(context["file"]), str(Path(package["dir"]) / "bin/pm2"), username):
+        if not re.fullmatch(r"[A-Za-z0-9_./@:+-]+", value):
+            raise UnodeError("PM2 startup 无法安全处理此路径或名称：" + value)
+    return context
+
+
+def startup_authorize():
+    if os.getuid() != 0:
+        if not shutil.which("sudo"):
+            raise UnodeError("重建启动配置需要 sudo")
+        result = subprocess.run(["sudo", "-v"])
+        if result.returncode:
+            raise UnodeError("管理员授权未完成，未修改启动配置")
+
+
+def startup_admin(arguments, env, log, check=True):
+    # Explicit argv/environment; never evaluate the sudo command printed by PM2.
+    command = [] if os.getuid() == 0 else ["sudo", "-n", "--"]
+    command += ["/usr/bin/env", "-u", "BASH_ENV", "-u", "ENV", "-u", "NODE_OPTIONS", "-u", "NODE_PATH"]
+    command += [key + "=" + env[key] for key in ("PATH", "HOME", "USER", "LOGNAME", "PM2_HOME", "NVM_BIN", "NVM_INC", "_") if key in env]
+    return run(command + [str(v) for v in arguments], timeout=120, check=check, log=log)
+
+
+def wait_startup_apps(before, target, package, home, settle):
+    deadline = time.monotonic() + max(10, settle * 2)
+    previous, stable_since, error = None, time.monotonic(), "后台未响应"
+    while time.monotonic() <= deadline:
+        try:
+            after = pm2_snapshot(target["path"], package, home)
+            verify_original_apps(before, after, target["version"])
+            signature = sorted((a.get("pm_id", -1), a.get("pid", 0), a["pm2_env"].get("restart_time", 0)) for a in after["apps"])
+            if signature != previous:
+                previous, stable_since = signature, time.monotonic()
+            if time.monotonic() - stable_since >= settle:
+                return after
+        except UnodeError as exc:
+            error, previous, stable_since = str(exc), None, time.monotonic()
+        time.sleep(0.5)
+    raise UnodeError("重建后应用验收未通过：" + error)
+
+
+def perform_restartup(args, target, state, context=None):
+    context = context or restartup_context(args, target)
+    package, env, file = context["package"], context["env"], context["file"]
+    entry = Path(package["dir"]) / "bin/pm2"
+    before = pm2_snapshot(target["path"], package, args.pm2_home)
+    check_original_apps(before)
+    if not before:
+        raise UnodeError("没有运行中的 PM2；请先启动需要管理的应用，未恢复旧 dump 或创建空后台")
+    section("PM2 startup 重建")
+    ui("目标 Node：{}（{}）".format(highlight(target["version"]), target["path"]))
+    ui("PM2：" + str(entry))
+    ui("PM2_HOME：" + str(args.pm2_home))
+    ui("启动配置：" + str(file))
+    ui("执行 pm2 save → unstartup → startup；可能重启受管应用。")
+    state.write(state.folder / "restartup-before.json", before)
+    if context["exists"]:
+        state.write(state.folder / "startup-config.original", file.read_bytes())
+    for name in ("dump.pm2", "dump.pm2.bak"):
+        source = args.pm2_home / name
+        if source.exists():
+            state.write(state.folder / (name + ".pre-restartup"), source.read_bytes())
+    startup_authorize()
+    log = state.folder / "restartup.log"
+    run([target["path"], entry, "save"], env=env, log=log)
+    saved = (args.pm2_home / "dump.pm2").read_bytes()
+    state.write(state.folder / "dump.pm2.restartup", saved)
+    common = [context["platform"], "-u", env["USER"], "--service-name", context["service"]]
+    mutated = False
+    try:
+        mutated = True
+        if context["exists"]:
+            startup_admin([target["path"], entry, "unstartup", *common], env, log)
+            if file.exists():
+                raise UnodeError("pm2 unstartup 后旧配置仍存在，停止重建")
+        if context["platform"] == "launchd":
+            # PM2's filename (pm2.user) may differ from the real Label (com.PM2).
+            for job in context["jobs"]:
+                startup_admin(["/bin/launchctl", "bootout", job], env, log, check=False)
+            if launchd_jobs("com.PM2", file):
+                raise UnodeError("旧 launchd 服务未成功卸载")
+            file.parent.mkdir(parents=True, exist_ok=True)
+        startup_admin([target["path"], entry, "startup", *common], env, log)
+        if not file.is_file():
+            raise UnodeError("pm2 startup 没有生成启动配置")
+        startup_admin(["/bin/chmod", "644", file], env, log)
+        if context["platform"] == "systemd":
+            startup_admin(["systemctl", "daemon-reload"], env, log)
+            startup_admin(["systemctl", "start", context["unit"]], env, log)
+            run(["systemctl", "is-enabled", context["unit"]], log=log)
+            run(["systemctl", "is-active", context["unit"]], log=log)
+        else:
+            _, config = launchagent_config(context["service"])
+            if config.get("EnvironmentVariables", {}).get("PM2_HOME") != str(args.pm2_home):
+                raise UnodeError("新启动配置的 PM2_HOME 不符")
+            if not launchd_jobs(config["Label"], file):
+                raise UnodeError("新 launchd 服务未加载")
+        after = wait_startup_apps(before, target, package, args.pm2_home, args.settle)
+        state.write(state.folder / "restartup-after.json", after)
+        if args.health_url:
+            health_check(args.health_url)
+        node_check = startup_node_check(target, args.service)
+        if node_check.get("node", {}).get("path") != target["path"] or node_check["status"] != "match":
+            return {"status": "needs-review", "details": "启动配置 Node 版本或路径未匹配目标", "node_check": node_check}
+        if context["platform"] == "systemd":
+            result = startup_check(args.pm2_home, target, args.service)
+        else:
+            result = {"status": "config-passed", "details": "启动配置、服务加载及应用已验证；未验证机器重启"}
+        state.write(state.folder / "startup-check.json", result)
+        return result
+    except BaseException as exc:
+        recovery = {"status": "not-needed"}
+        if mutated:
+            try:
+                try:
+                    current = pm2_snapshot(target["path"], package, args.pm2_home)
+                    verify_original_apps(before, current, current["report"]["node_version"].lstrip("v") if current else target["version"])
+                except UnodeError:
+                    if context["platform"] == "systemd":
+                        startup_admin(["systemctl", "stop", context["unit"]], env, log, check=False)
+                    else:
+                        for job in launchd_jobs("com.PM2", file):
+                            startup_admin(["/bin/launchctl", "bootout", job], env, log)
+                    if daemon_pid(args.pm2_home):
+                        run([target["path"], entry, "kill"], env=env, log=log)
+                    state.write(args.pm2_home.resolve() / "dump.pm2", saved)
+                    run([target["path"], entry, "resurrect"], env=env, log=log)
+                    wait_startup_apps(before, target, package, args.pm2_home, args.settle)
+                recovery = {"status": "applications-available", "details": "原应用状态已核实；启动配置仍需处理"}
+            except BaseException as recovery_error:
+                recovery = {"status": "failed", "error": str(recovery_error)}
+            state.write(state.folder / "restartup-recovery.json", recovery)
+        if isinstance(exc, (KeyboardInterrupt, EOFError)):
+            raise
+        raise UnodeError("startup 重建失败：{}；恢复结果：{}；备份：{}".format(exc, recovery["status"], state.folder)) from exc
+
+
+def restartup_main(argv):
+    args = restartup_parser().parse_args(argv)
+    if not 3 <= args.settle <= 3600:
+        raise UnodeError("--settle 必须为 3..3600 秒")
+    if args.health_url and urllib.parse.urlparse(args.health_url).scheme not in ("http", "https"):
+        raise UnodeError("--health-url 只支持 HTTP(S)")
+    args.pm2_home = args.pm2_home.expanduser().absolute()
+    target = node_info(shutil.which("node"))
+    if not target or version_tuple(target["version"]) < (18, 0, 0):
+        raise UnodeError("restartup 需要当前终端可用的 Node >=18；请先 nvm use 目标版本")
+    context = restartup_context(args, target)
+    intro()
+    ui("当前 Node：{}（{}）".format(highlight(target["version"]), target["path"]))
+    ui("PM2_HOME：" + str(args.pm2_home))
+    ui("启动配置：" + str(context["file"]))
+    if args.check:
+        result = startup_node_check(target, args.service)
+        display_startup_node(result, target)
+        outro("只检查；未保存、卸载或重建启动配置。")
+        return 0 if result["status"] == "match" else 2
+    if not interactive():
+        raise UnodeError("请在交互终端执行 restartup；只检查请加 --check")
+    state = State(config=args.config)
+    with lock_file(state.home / "unode.lock"), lock_file(args.pm2_home / ".unode.lock"):
+        state.start({"action": "restartup", "target": target, "service": args.service, "pm2_home": str(args.pm2_home)})
+        try:
+            result = perform_restartup(args, target, state, context)
+            node_check = startup_node_check(target, args.service)
+            display_startup_node(node_check, target)
+            pending = result["status"] != "config-passed"
+            state.finish("passed-with-pending-startup" if pending else "passed", target=target, startup=result, startup_node=node_check)
+            outro("startup 重建完成。" if not pending else "startup 已重建，配置待复核。")
+            return 2 if pending else 0
+        except BaseException as exc:
+            state.finish("interrupted" if isinstance(exc, (KeyboardInterrupt, EOFError)) else "failed", error=str(exc), target=target)
+            raise
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "show":
+        args = show_parser().parse_args(argv[1:])
+        return show_startup(args.service)
+    if argv and argv[0] == "restartup":
+        return restartup_main(argv[1:])
+    args = parser().parse_args(argv)
+    state = State(config=args.config)
+    config = state.config()
+    if args.settle is None:
+        args.settle = config["settle_seconds"]
+    if platform.system() not in ("Darwin", "Linux"):
+        raise UnodeError("目前支持 macOS 和 Linux")
+    if args.pm2 and (args.version or args.m or args.node_path):
+        raise UnodeError("--pm2 只处理当前 Node 的 PM2，不能同时指定版本或管理方式")
+    if args.node_path and args.m not in (None, "path"):
+        raise UnodeError("--node-path 仅用于 --m path")
+    if not 3 <= args.settle <= 3600:
+        raise UnodeError("--settle 必须为 3..3600 秒")
+    if args.health_url and urllib.parse.urlparse(args.health_url).scheme not in ("http", "https"):
+        raise UnodeError("--health-url 只支持 HTTP(S)")
+    if not args.check and not interactive():
+        raise UnodeError("请在交互终端运行；非交互检查请使用 --check")
+    args.pm2_home = args.pm2_home.expanduser().absolute()
+    intro()
+    section("当前环境")
+    current = node_info(shutil.which("node"))
+    ui("当前 Node：" + highlight(current["version"] if current else "未安装/不在 PATH"))
+    if current:
+        ui("Node 路径：" + current["path"])
+    manager = None
+    metadata = None
+    set_default = False
+    reinstall_from = None
+    if args.pm2:
+        if not current:
+            raise UnodeError("--pm2 需要当前终端可用的 Node")
+        target = current
+        version = target["version"]
+        installed = target
+    else:
+        if args.node_path and not args.m:
+            args.m = "path"
+        section("选择 Node 管理方式")
+        manager = select_manager(args, state)
+        if args.m:
+            ui("已选择：" + highlight(manager.name))
+        section("选择目标 Node 版本")
+        if manager.name == "path":
+            binary = args.node_path
+            if not binary:
+                if args.check:
+                    raise UnodeError("--m path --check 需要 --node-path")
+                binary = Path(input(dim("│") + "  已有 Node 的绝对路径：").strip()).expanduser()
+            if not binary.is_absolute():
+                raise UnodeError("已有 Node 路径必须是绝对路径")
+            installed = node_info(binary)
+            if args.version and installed["version"] != resolve_version(args.version):
+                raise UnodeError("指定路径的 Node 与目标版本不符")
+            version = installed["version"]
+        else:
+            selector = select_version(args)
+            if manager.name == "system":
+                version, metadata = manager.system_target(selector)
+            else:
+                version = resolve_version(selector)
+            installed = manager.installed(version)
+        if manager.name == "nvm" and current and current["version"] != version and not args.check:
+            source = manager.installed(current["version"])
+            if source and source["path"] == current["path"]:
+                if confirm("是否从当前 Node 重装全局 npm 包？（不包含 pnpm add -g 安装的包）", default=True):
+                    reinstall_from = current["version"]
+                    metadata = {"reinstall_from": reinstall_from}
+            else:
+                ui("当前 Node 不属于此 nvm，无法用 --reinstall-packages-from 迁移全局包。")
+        target = installed or {"version": version, "path": None}
+        ui("目标 Node：" + highlight(version))
+        ui("目标路径：" + target["path"] if target["path"] else "安装状态：目标版本尚未安装")
+    if version_tuple(version) < (18, 0, 0):
+        raise UnodeError("本工具目前要求目标 Node >=18")
+    # Critical: no PM2 discovery, RPC, save, install or restart before this answer.
+    section("PM2 处理")
+    process_pm2 = choose_pm2(args)
+    old_package = None
+    before = None
+    if process_pm2:
+        if not HELPER.is_file():
+            raise UnodeError("pm2-helper.cjs 缺失，请重新运行 install.sh")
+        for key in ("PM2_RPC_PORT", "PM2_PUB_PORT", "PM2_PID_FILE_PATH"):
+            if os.environ.get(key):
+                raise UnodeError("暂不支持自定义 " + key)
+        if current and version_tuple(current["version"]) < (18, 0, 0):
+            raise UnodeError("读取旧 PM2 环境需要 Node >=18；请使用已验证的新 Node 和 --pm2-dir")
+        old_package = pm2_package(current["path"] if current else None, args.pm2_dir)
+        before = pm2_snapshot(current["path"], old_package, args.pm2_home) if current and daemon_pid(args.pm2_home) else None
+        check_original_apps(before)
+        if not current and daemon_pid(args.pm2_home):
+            raise UnodeError("存在 PM2 后台但当前无可用 Node，无法备份，请先恢复原 Node 环境")
+        if not old_package:
+            ui("当前环境未安装 PM2；计划在目标 Node 下安装 PM2。")
+    else:
+        ui("PM2 迁移：已跳过，不连接或重启后台。")
+    if manager and manager.name in ("nvm", "fnm") and not args.check:
+        section("默认 Node 设置")
+        set_default = confirm("是否更新管理工具的默认 Node 版本？（新终端需已加载该工具）", default=True)
+    did_restartup = False
+    if not args.check:
+        section("开机启动设置")
+        did_restartup = confirm("是否 restartup（重建 PM2 开机启动配置，可能重启应用）？", default=True)
+    plan = {"manager": manager.name if manager else None, "current": current, "target": target,
+            "process_pm2": process_pm2, "pm2_version": old_package["version"] if old_package else None,
+            "pm2_home": str(args.pm2_home) if process_pm2 or did_restartup else None, "set_default": set_default,
+            "reinstall_packages_from": reinstall_from, "restartup": did_restartup}
+    section("执行计划")
+    if manager:
+        ui("Node {}，管理方式 {}：{}".format(highlight(version), manager.name, "已安装，跳过安装并使用已有路径" if installed else "安装并使用目标版本"))
+        if current and installed and current == installed:
+            ui("当前版本与来源已经符合目标，跳过 Node 安装和切换。")
+        if manager.name == "nvm" and not manager.available():
+            ui("先安装 nvm {} 到 {}（不修改 shell 配置）".format(NVM_RELEASE, manager.nvm_dir))
+        if manager.name in ("n", "system"):
+            ui("注意：该方式可能替换共享 Node 安装，影响其他使用该路径的服务。")
+    if process_pm2:
+        ui("PM2：{}；{}".format("保持软件版本 " + old_package["version"] if old_package else "首次安装", "迁移后台、核验 cluster 和开机配置" if before else "无运行中的应用，不创建后台"))
+        if before:
+            counts = Counter(app["pm2_env"].get("status") for app in before["apps"])
+            ui("在线应用：{} 个，更新时重启并验收。".format(counts["online"]))
+            ui("已停止应用：{} 个，保持停止，不拉起。".format(counts["stopped"]))
+    if reinstall_from:
+        ui("nvm：从 Node {} 重装全局 npm 包（不包含 pnpm add -g 安装的包）。".format(reinstall_from))
+    ui("startup：" + ("使用目标 Node 重建，可能重启受管应用" if did_restartup else "跳过重建，仅检查版本"))
+    ui("运行记录：" + str(state.home))
+    ui("公共配置：" + str(state.config_file) + "（运行时只读）")
+    if args.check:
+        pending = False
+        if before:
+            ui("PM2 后台 Node：" + highlight(before["report"]["node_version"]))
+            try:
+                verify_original_apps(before, before, version)
+            except UnodeError as exc:
+                ui("待处理：" + str(exc))
+                pending = True
+            result = startup_check(args.pm2_home, target, args.service)
+            ui("开机启动检查：" + json.dumps(result, ensure_ascii=False))
+            pending = pending or result["status"] in ("needs-review", "manual")
+        outro("只检查，未安装、保存或重启任何服务。")
+        return 2 if pending else 0
+    if not confirm("执行上述计划？", default=True):
+        outro("已取消，未执行升级。")
+        return 0
+    with ExitStack() as stack:
+        stack.enter_context(lock_file(state.home / "unode.lock"))
+        if process_pm2 or did_restartup:
+            stack.enter_context(lock_file(args.pm2_home / ".unode.lock"))
+        folder = state.start(plan)
+        section("执行与验证")
+        ui("备份和日志：" + str(folder))
+        try:
+            if before:
+                fresh = pm2_snapshot(current["path"], old_package, args.pm2_home)
+                verify_original_apps(before, fresh, before["report"]["node_version"].lstrip("v"))
+                check_original_apps(fresh)
+                before = fresh
+                state.write(folder / "pm2-before.json", before)
+                for name in ("dump.pm2", "dump.pm2.bak"):
+                    file = args.pm2_home / name
+                    if file.exists():
+                        state.write(folder / (name + ".original"), file.read_text())
+                # Save a fresh process list before changing any Node installation.
+                run([current["path"], Path(old_package["dir"]) / "bin/pm2", "save"],
+                    env={**node_env(current["path"]), "PM2_HOME": str(args.pm2_home)}, log=folder / "pm2-save.log")
+                state.write(folder / "dump.pm2.pre-node", (args.pm2_home / "dump.pm2").read_text())
+                state.write(folder / "startup-before.json", startup_check(args.pm2_home, current, args.service))
+                restore = "恢复前先检查实际进程状态；以下操作会中断此 PM2_HOME 的所有应用。\n"
+                restore += "保留旧 Node 和旧 PM2 包。n/system 可能已覆盖共享安装，需先恢复旧运行时。\n"
+                restore += "备份的进程表：{}\n".format(folder / "dump.pm2.pre-node")
+                restore += "原 Node：{}\n原 PM2：{}\n".format(current["path"], old_package["dir"])
+                restore += "原 PM2_HOME：{}\n不自动替换在线进程的 dump 或回滚软件。\n".format(args.pm2_home)
+                state.write(folder / "recovery.txt", restore)
+            if manager and not installed:
+                target = manager.install(version, metadata)
+            elif manager and reinstall_from:
+                # nvm install also supports migrating packages to an installed version.
+                target = manager.install(version, metadata)
+            if not target.get("path"):
+                raise UnodeError("没有可用的目标 Node 路径")
+            if node_info(target["path"])["version"] != version:
+                raise UnodeError("目标 Node 版本核验失败")
+            ui("✓ 目标 Node：{}（{}）".format(highlight(version), target["path"]))
+            state.record.update(target=target, node_verified=True)
+            startup = {"status": "skipped"}
+            if process_pm2:
+                package, startup = migrate_pm2(args, target, old_package, before, state)
+            elif args.health_url:
+                health_check(args.health_url)
+            if set_default:
+                manager.set_default(version)
+            if did_restartup:
+                startup = perform_restartup(args, target, state)
+            startup_node = startup_node_check(target, args.service)
+            display_startup_node(startup_node, target)
+            state.write(folder / "startup-node-check.json", startup_node)
+            pending = startup["status"] in ("manual", "needs-review") or startup_node["status"] in ("mismatch", "manual")
+            state.finish("passed-with-pending-startup" if pending else "passed", target=target, startup=startup,
+                         startup_node=startup_node, restartup=did_restartup, health="passed" if args.health_url else "not-verified")
+            if before and not args.health_url:
+                ui("业务尚未验证：没有提供 --health-url。")
+            if startup["status"] not in ("skipped", "not-applicable", "config-passed"):
+                ui("! 开机启动配置待复核；没有执行服务重启或机器重启。")
+            if manager and manager.name == "nvm":
+                ui("当前终端如需切换：source {} && nvm use {}".format(shlex.quote(str(manager.nvm_script)), version))
+            elif manager and manager.name == "fnm":
+                ui("当前终端如需切换：fnm use " + version)
+            elif manager and manager.name in ("path", "system"):
+                ui("后续终端请把 {} 加入 PATH。".format(Path(target["path"]).parent))
+            outro("✓ Node 与 startup 处理完成。" if did_restartup else ("✓ Node/PM2 运行步骤已完成。" if process_pm2 else "✓ Node 处理完成，PM2 已跳过。"))
+            return 2 if pending else 0
+        except BaseException as exc:
+            state.finish("interrupted" if isinstance(exc, KeyboardInterrupt) else "failed", error=str(exc))
+            print("未自动回滚 Node、应用或系统服务；原状态和日志保留在 " + str(folder), file=sys.stderr)
+            raise
+
+
+if __name__ == "__main__":
+    os.umask(0o077)
+    try:
+        sys.exit(main())
+    except (KeyboardInterrupt, EOFError):
+        print("\n已取消。", file=sys.stderr)
+        sys.exit(130)
+    except (UnodeError, OSError, ValueError) as exc:
+        print("unode：" + str(exc), file=sys.stderr)
+        sys.exit(1)
