@@ -90,6 +90,7 @@ class RestartupTests(unittest.TestCase):
             stack.enter_context(patch.object(u, "pm2_snapshot", side_effect=lambda *a: before if backend["daemon"] else None))
             stack.enter_context(patch.object(u, "daemon_pid", side_effect=lambda *a: 123 if backend["daemon"] else None))
             authorize = stack.enter_context(patch.object(u, "startup_authorize"))
+            stack.enter_context(patch.object(u, "initialize_pm2_home"))
             stack.enter_context(patch.object(u, "startup_admin", side_effect=admin))
             stack.enter_context(patch.object(u, "run", side_effect=execute))
             stack.enter_context(patch.object(u, "launchd_jobs", side_effect=lambda *a: ["gui/501/com.PM2"] if backend["loaded"] else []))
@@ -372,6 +373,21 @@ class NvmPackageTests(unittest.TestCase):
 
 
 class RealRestartupTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("UNODE_TEST_PM2_DIR") and shutil.which("node"), "opt in with isolated PM2 package")
+    def test_real_empty_home_initialization_creates_writable_files_without_daemon(self):
+        target = u.node_info(shutil.which("node"))
+        package = {"dir": os.environ["UNODE_TEST_PM2_DIR"]}
+        with tempfile.TemporaryDirectory(prefix="unode-empty-home-") as temp:
+            home = Path(temp) / "pm2"
+            env = dict(u.node_env(target["path"]), PM2_HOME=str(home))
+            u.initialize_pm2_home(target, package, home, env, None)
+            self.assertFalse((home / "pm2.pid").exists())
+            self.assertFalse((home / "rpc.sock").exists())
+            for name in ("logs", "pids", "modules", "module_conf.json", "touch"):
+                file = home / name
+                self.assertEqual(file.stat().st_uid, os.getuid())
+                self.assertTrue(os.access(file, os.W_OK))
+
     @unittest.skipUnless(os.environ.get("UNODE_TEST_PM2_DIR") and shutil.which("node"), "opt in with isolated PM2 package")
     def test_real_pm2_recovery_preserves_stopped_apps(self):
         package = {"dir": os.environ["UNODE_TEST_PM2_DIR"], "version": "fixture"}

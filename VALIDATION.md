@@ -3,9 +3,10 @@
 ## 首次安装与 systemd 后台接管（0.1.3，2026-10-28）
 
 - 首次安装后无后台、已有空后台均可选择 restartup，写入空清单并由系统服务启动 PM2；跳过 restartup 时仍不创建后台。
+- 在 sudo 注册前由原用户初始化 PM2 文件结构并检查归属，避免 root 所有的 logs/pids/modules 阻止后续应用启动；真实 API 初始化测试确认未创建后台 PID 或 RPC socket。
 - 注册新配置前结束终端启动或迁移后遗留的 PM2 后台，防止 systemd 因 PID 不属于服务而报 `Result: protocol`；清除旧失败状态后启动并检查服务。
 - 空后台初始化保护 `dump.pm2` 和 `dump.pm2.bak` 中的旧应用及损坏数据；PID 缺失但 RPC socket 存在时拒绝覆盖。初始化失败不在服务外恢复空后台。
-- macOS 本地 118 项 Python 测试全部通过，含真实隔离 PM2 恢复及 Node 20 → Node 22 的迁移；21 项 Node helper 测试全部通过。Python 3.8 语法兼容、安装脚本语法、diff 检查通过。
+- macOS 本地 120 项 Python 测试全部通过，含真实隔离 PM2 恢复及 Node 20 → Node 22 的迁移；21 项 Node helper 测试全部通过。Python 3.8 语法兼容、安装脚本语法、diff 检查通过。
 
 日期：2026-10-27，当前源码版本 0.1.2。测试平台：macOS。本次更新全局安装的 unode，保留 `/etc/unode/config.json`；没有升级真实用户的 Node、修改业务 PM2 或重启真实系统服务。此前对用户真实 PM2 仅做了直接 RPC 只读检查，确认 13 个 online、4 个普通 stopped 应用；没有对它们执行 update/save/stop/start/kill。
 

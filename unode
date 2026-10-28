@@ -1225,6 +1225,18 @@ def wait_startup_apps(before, target, package, home, settle):
     raise UnodeError("重建后应用验收未通过：" + error)
 
 
+def initialize_pm2_home(target, package, home, env, log):
+    # Constructing PM2's API creates its file structure without connecting to or
+    # spawning a daemon. Do this as the service user before the sudo CLI can
+    # create root-owned logs/pids/modules and module_conf.json on a fresh install.
+    run([target["path"], "-e", "require(process.argv[1]).disconnect()", package["dir"]],
+        env=dict(env, PM2_DISCRETE_MODE="1"), log=log)
+    for name in ("logs", "pids", "modules", "module_conf.json", "touch"):
+        file = home / name
+        if not file.exists() or file.stat().st_uid != os.getuid() or not os.access(file, os.W_OK):
+            raise UnodeError("PM2 运行文件未归属当前用户或不可写，请先检查权限：" + str(file))
+
+
 def perform_restartup(args, target, state, context=None):
     context = context or restartup_context(args, target)
     package, env, file = context["package"], context["env"], context["file"]
@@ -1262,6 +1274,7 @@ def perform_restartup(args, target, state, context=None):
     startup_authorize()
     log = state.folder / "restartup.log"
     if initializing:
+        initialize_pm2_home(target, package, args.pm2_home, env, log)
         # Do not invoke PM2 CLI here: it would create a daemon outside the service.
         state.write(args.pm2_home.resolve() / "dump.pm2", b"[]\n")
     else:

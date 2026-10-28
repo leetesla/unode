@@ -149,7 +149,7 @@ unode restartup --service my-pm2 --pm2-home /srv/app/.pm2
 
 **重建可能中断应用。** Linux 的 unstartup 会停止服务，默认 ExecStop 执行 pm2 kill；startup 注册后会 daemon-reload、清除旧失败状态并启动服务。macOS 按 plist 的实际 Label 卸载旧服务，检查新服务的加载结果。随后验证应用数量、原 online/stopped 状态、连续稳定性、启动 Node 版本及路径；有 `--health-url` 时再次检查业务。
 
-没有后台或后台应用表为空时，允许初始化自启：仅当 `dump.pm2` 和 `dump.pm2.bak` 均不存在或为 `[]`，才写入空清单，由系统服务启动后台并验收。已有应用清单、损坏清单、RPC socket 存在但 PID 无法核实的情况会在修改前报错。初始化失败时不在服务外重新创建空后台；成功后可用 `pm2 start ...` 添加应用，再执行 `pm2 save` 保存。
+没有后台或后台应用表为空时，允许初始化自启：仅当 `dump.pm2` 和 `dump.pm2.bak` 均不存在或为 `[]`，才写入空清单，由系统服务启动后台并验收。先以当前用户构造 PM2 API（不连接或启动后台），初始化日志、PID、模块目录及配置文件并检查归属，防止 sudo 注册时生成 root 所有的运行文件。已有应用清单、损坏清单、RPC socket 存在但 PID 无法核实的情况会在修改前报错。初始化失败时不在服务外重新创建空后台；成功后可用 `pm2 start ...` 添加应用，再执行 `pm2 save` 保存。
 
 未知的自定义启动命令、用户/PM2_HOME 不符、systemd drop-in/EnvironmentFile 不直接覆盖；PM2 生成器无法正确引用的带空格或特殊字符的启动文件/PM2 路径会在修改前报错。失败时尝试恢复原应用，并保存 `restartup-recovery.json`；启动配置仍可能需要根据备份人工修复，不伪报成功。不执行机器重启。
 
