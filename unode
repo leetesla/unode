@@ -27,7 +27,7 @@ import urllib.parse
 import urllib.request
 from xml.parsers.expat import ExpatError
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 HELPER = Path(__file__).resolve().with_name("pm2-helper.cjs")
 NODE_INDEX = "https://nodejs.org/dist/index.json"
 NVM_RELEASE = "v0.40.8"
@@ -707,12 +707,74 @@ def startup_unit(service=None):
     return unit
 
 
+def volta_pm2_runtime_node(executable, environment):
+    """Resolve the Node runtime pinned to a PM2 package managed by Volta.
+
+    The executable under ~/.volta/bin is a native Volta shim, not a text
+    script. Never try to decode its bytes as a UTF-8 shebang.
+    """
+    executable_path = Path(executable)
+    configured_home = environment.get("VOLTA_HOME")
+    if configured_home:
+        volta_home = Path(configured_home).expanduser()
+        if executable_path != volta_home / "bin" / "pm2":
+            return None
+    elif executable_path.parent.name == "bin" and executable_path.parent.parent.name == ".volta":
+        volta_home = executable_path.parent.parent
+    else:
+        return None
+
+    volta = volta_home / "bin" / "volta"
+    if not volta.is_file():
+        found = shutil.which("volta", path=environment.get("PATH", ""))
+        if not found:
+            raise UnodeError("检测到 Volta PM2 shim，但找不到 Volta CLI，无法验证启动 Node")
+        volta = Path(found)
+
+    result = run([str(volta), "list", "all"], env=environment, check=False)
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        raise UnodeError("无法读取 Volta 的 PM2 运行时绑定" + (": " + detail if detail else ""))
+
+    lines = result.stdout.splitlines()
+    package_index = next(
+        (i for i, line in enumerate(lines) if re.match(r"^\s*pm2@\S+", line)),
+        None,
+    )
+    if package_index is None:
+        raise UnodeError("Volta 未列出全局 PM2 包，无法确认其绑定的 Node 版本")
+
+    version = None
+    for line in lines[package_index + 1:]:
+        item = line.strip()
+        if not item:
+            continue
+        # Stop at the next package entry; don't accidentally use another
+        # global package's runtime.
+        if re.match(r"^(?:@[\w.-]+/)?[\w.-]+@\S+", item):
+            break
+        match = re.search(r"\bruntime:\s*node@v?(\d+\.\d+\.\d+)\b", item)
+        if match:
+            version = match.group(1)
+            break
+
+    if not version:
+        raise UnodeError("无法从 volta list all 中解析 PM2 绑定的 Node 版本")
+
+    node = volta_home / "tools" / "image" / "node" / version / "bin" / "node"
+    if not node.is_file():
+        raise UnodeError(
+            "Volta 为 PM2 绑定的 Node {} 不存在或不可访问：{}".format(version, node)
+        )
+    return str(node)
+
+
 def startup_node_binary(arguments, environment):
     """Resolve common PM2 launch commands without executing a shell or PM2."""
     if not isinstance(arguments, list) or not arguments or not all(isinstance(a, str) for a in arguments):
         raise UnodeError("启动命令无法解析")
     if arguments[0] in ("/bin/sh", "/bin/bash", "/bin/zsh"):
-        if len(arguments) != 3 or arguments[1] != "-c" or re.search(r"[$`;|&<>\n]", arguments[2]):
+        if len(arguments) != 3 or arguments[1] != "-c" or re.search(r"[$;|&<>\n]", arguments[2]) or chr(96) in arguments[2]:
             raise UnodeError("自定义 shell 启动命令需人工复核")
         arguments = shlex.split(arguments[2])
         if not arguments:
@@ -735,10 +797,30 @@ def startup_node_binary(arguments, environment):
         return executable
     if Path(executable).name != "pm2":
         raise UnodeError("无法识别自定义启动程序：" + executable)
-    with open(executable, "rb") as source:
-        shebang = source.readline(4096).decode("utf-8").strip()
-    if not shebang.startswith("#!"):
-        raise UnodeError("PM2 启动文件缺少可识别的 Node shebang")
+
+    # Volta's ~/.volta/bin/pm2 entry is a native shim. Its runtime is pinned
+    # per global package, so use Volta's own toolchain report instead of
+    # reading the shim as if it were a UTF-8 JavaScript file or using the
+    # potentially different default Node version from PATH.
+    volta_node = volta_pm2_runtime_node(executable, environment)
+    if volta_node:
+        return volta_node
+
+    try:
+        with open(executable, "rb") as source:
+            first_line = source.readline(4096)
+    except OSError as exc:
+        raise UnodeError("无法读取 PM2 启动文件：{}（{}）".format(executable, exc))
+
+    # A native shim or other binary is not a text shebang script. Check the
+    # bytes before decoding so invalid UTF-8 never leaks as a startup error.
+    if not first_line.startswith(b"#!"):
+        raise UnodeError("PM2 启动文件不是可识别的文本 shebang 脚本：" + executable)
+    try:
+        shebang = first_line.decode("ascii").strip()
+    except UnicodeDecodeError as exc:
+        raise UnodeError("PM2 启动文件的 shebang 不是 ASCII 文本：" + executable) from exc
+
     interpreter = shlex.split(shebang[2:])
     if interpreter[:1] == ["/usr/bin/env"]:
         interpreter = interpreter[1:]

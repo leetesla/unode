@@ -655,6 +655,60 @@ class StartupNodeTests(unittest.TestCase):
         self.assertEqual(result["status"], "match")
         probe.assert_called_once_with("/pinned/bin/node", check=False)
 
+    def test_volta_pm2_shim_uses_package_pinned_node_without_decoding_shim(self):
+        volta_home = self.root / ".volta"
+        volta_bin = volta_home / "bin"
+        volta_bin.mkdir(parents=True)
+        volta = volta_bin / "volta"
+        volta.write_text("#!/bin/sh\n")
+        volta.chmod(0o755)
+
+        # Volta's command shim is binary data, not a UTF-8 JavaScript script.
+        shim = volta_bin / "pm2"
+        shim.write_bytes(b"\xca\xfe\xba\xbe")
+
+        pinned_node = volta_home / "tools" / "image" / "node" / "22.23.4" / "bin" / "node"
+        pinned_node.parent.mkdir(parents=True)
+        pinned_node.write_text("#!/bin/sh\n")
+        pinned_node.chmod(0o755)
+
+        environment = {
+            "VOLTA_HOME": str(volta_home),
+            "PATH": str(volta_bin),
+            "HOME": str(self.root),
+        }
+        listing = (
+            "⚡️ User toolchain:\n"
+            "    Node runtimes:\n"
+            "        v22.23.4 (default)\n"
+            "    Packages:\n"
+            "        pm2@6.0.13 (default)\n"
+            "            binary tools: pm2, pm2-dev\n"
+            "            platform:\n"
+            "                runtime: node@22.23.4\n"
+            "                package manager: npm@built-in\n"
+        )
+        with patch.object(
+            u, "run",
+            return_value=subprocess.CompletedProcess(
+                [str(volta), "list", "all"], 0, listing, ""
+            ),
+        ) as command:
+            resolved = u.startup_node_binary([str(shim), "resurrect"], environment)
+
+        self.assertEqual(resolved, str(pinned_node))
+        command.assert_called_once_with(
+            [str(volta), "list", "all"], env=environment, check=False
+        )
+
+    def test_non_text_pm2_binary_returns_clear_error_not_unicode_error(self):
+        self.pm2.write_bytes(b"\xca\xfe\xba\xbe")
+        with self.assertRaisesRegex(u.UnodeError, "shebang"):
+            u.startup_node_binary(
+                [str(self.pm2), "resurrect"],
+                {"PATH": str(self.bin)},
+            )
+
     def test_shell_expressions_are_not_executed_or_claimed_verified(self):
         result, probe = self.mac_check(arguments=["/bin/sh", "-c", "$(touch /tmp/forbidden) resurrect"])
         self.assertEqual(result["status"], "manual")
