@@ -1295,7 +1295,9 @@ def perform_restartup(args, target, state, context=None):
         startup_admin(["/bin/chmod", "644", file], env, log)
         if context["platform"] == "systemd":
             startup_admin(["systemctl", "daemon-reload"], env, log)
-            startup_admin(["systemctl", "reset-failed", context["unit"]], env, log)
+            # A fresh unit may have no loaded runtime state to reset. Starting
+            # and checking the service below remain mandatory.
+            startup_admin(["systemctl", "reset-failed", context["unit"]], env, log, check=False)
             startup_admin(["systemctl", "start", context["unit"]], env, log)
             run(["systemctl", "is-enabled", context["unit"]], log=log)
             run(["systemctl", "is-active", context["unit"]], log=log)

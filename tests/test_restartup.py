@@ -62,6 +62,8 @@ class RestartupTests(unittest.TestCase):
                 verb = command[2] if command[0] == target["path"] else command[1]
                 backend["events"].append(verb)
                 if verb == fail:
+                    if not check:
+                        return subprocess.CompletedProcess(command, 1, "", "fixture " + verb + " failure")
                     raise u.UnodeError("fixture " + verb + " failure")
                 if verb == "unstartup":
                     file.unlink()
@@ -130,6 +132,12 @@ class RestartupTests(unittest.TestCase):
         self.assertNotIn("unstartup", result["events"])
         self.assertTrue(result["config_exists"])
         self.assertIsNone(result["error"])
+
+    def test_new_unit_without_failed_state_can_still_start(self):
+        result = self.scenario(no_daemon=True, exists=False, fail="reset-failed")
+        self.assertIsNone(result["error"])
+        self.assertTrue(result["owned"])
+        self.assertIn("start", result["events"])
 
     def test_first_configuration_hands_terminal_daemon_to_systemd(self):
         result = self.scenario(exists=False)
