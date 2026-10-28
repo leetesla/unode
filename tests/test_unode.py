@@ -268,6 +268,24 @@ class MainFlowTests(unittest.TestCase):
         with self.assertRaises(u.UnodeError):
             u.main(["24", "--pm2", "--check"])
 
+    def test_pm2_only_initialization_reaches_restartup_with_or_without_empty_daemon(self):
+        package = {"dir": "/isolated/pm2", "version": "7.1.1"}
+        for live in (False, True):
+            with self.subTest(live=live), patch.dict(os.environ, {"PM2_RPC_PORT": ""}), \
+                    patch.object(u, "interactive", return_value=True), patch.object(u, "node_info", return_value=self.node), \
+                    patch.object(u, "confirm", side_effect=[True, True]), \
+                    patch.object(u, "daemon_pid", return_value=123 if live else None), \
+                    patch.object(u, "pm2_snapshot", return_value=snapshot([], self.node["version"]) if live else None), \
+                    patch.object(u, "pm2_package", side_effect=[package, package] if live else [None, None, package]), \
+                    patch.object(u, "npm", return_value=subprocess.CompletedProcess([], 0, "", "")) as npm, \
+                    patch.object(u, "perform_restartup", return_value={"status": "config-passed", "application_count": 0}) as restartup, \
+                    patch.object(u, "startup_node_check", return_value={"status": "match", "node": self.node}), \
+                    redirect_stdout(io.StringIO()):
+                self.assertEqual(u.main(["--pm2", "--pm2-home", str(Path(self.temp.name) / "pm2")]), 0)
+                restartup.assert_called_once()
+                self.assertEqual(npm.called, not live)
+                self.assertEqual(json.loads((self.home / "last-run.json").read_text())["status"], "passed")
+
     def test_noninteractive_apply_is_rejected(self):
         with patch.object(u, "interactive", return_value=False), self.assertRaises(u.UnodeError):
             u.main(["24"])
@@ -713,6 +731,9 @@ class StartupTests(unittest.TestCase):
 
     def test_correct_systemd_configuration(self):
         self.assertEqual(self.check()["status"], "config-passed")
+
+    def test_empty_dump_is_valid_for_service_without_applications(self):
+        self.assertEqual(self.check(dump=[])["status"], "config-passed")
 
     def test_wrong_user_and_old_pid_need_review(self):
         result = self.check({"User": "other-user", "MainPID": "999"})

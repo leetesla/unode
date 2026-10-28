@@ -15,7 +15,8 @@ from test_unode import u, application, snapshot
 
 class RestartupTests(unittest.TestCase):
     def scenario(self, system="systemd", exists=True, fail=None, no_daemon=False, node_match=True,
-                 once=False, disappears=False, never_registered=False):
+                 once=False, disappears=False, never_registered=False, empty=False,
+                 unmanaged=False, saved_dump=None, backup_dump=None, orphan_socket=False):
         with tempfile.TemporaryDirectory() as temp, ExitStack() as stack:
             root = Path(temp)
             home = root / "custom-pm2"
@@ -27,8 +28,14 @@ class RestartupTests(unittest.TestCase):
             package = {"dir": "/runtime/lib/node_modules/pm2", "version": "6.0.13"}
             online, stopped = application(version=target["version"]), application("fork_mode", "20.0.0", "job")
             stopped["pid"], stopped["pm2_env"]["status"] = 0, "stopped"
-            before = snapshot([online, stopped], target["version"])
-            backend = {"daemon": not no_daemon, "loaded": exists, "events": []}
+            before = snapshot([] if empty or no_daemon else [online, stopped], target["version"])
+            if saved_dump is not None:
+                (home / "dump.pm2").write_bytes(saved_dump)
+            if backup_dump is not None:
+                (home / "dump.pm2.bak").write_bytes(backup_dump)
+            if orphan_socket:
+                (home / "rpc.sock").touch()
+            backend = {"daemon": not no_daemon, "loaded": exists, "owned": exists and not unmanaged, "events": []}
             args = u.argparse.Namespace(pm2_home=home, pm2_dir=None, service="pm2-custom", settle=0, health_url=None)
             env = dict(u.node_env(target["path"]), PM2_HOME=str(home), HOME=temp, USER="fixture", LOGNAME="fixture")
             context = {"package": package, "env": env, "file": file, "exists": exists, "platform": system,
@@ -58,7 +65,7 @@ class RestartupTests(unittest.TestCase):
                     raise u.UnodeError("fixture " + verb + " failure")
                 if verb == "unstartup":
                     file.unlink()
-                    if system == "systemd":
+                    if system == "systemd" and backend["owned"]:
                         backend["daemon"] = False
                 elif verb == "bootout":
                     backend["loaded"], backend["daemon"] = False, False
@@ -70,7 +77,10 @@ class RestartupTests(unittest.TestCase):
                     else:
                         file.write_text("new startup definition\n")
                 elif verb == "start":
+                    if backend["daemon"]:
+                        raise u.UnodeError("fixture systemd refuses a daemon outside its service")
                     backend["daemon"] = True
+                    backend["owned"] = True
                 elif verb == "stop":
                     backend["daemon"] = False
                 return subprocess.CompletedProcess(command, 0, "", "")
@@ -82,7 +92,7 @@ class RestartupTests(unittest.TestCase):
             stack.enter_context(patch.object(u, "run", side_effect=execute))
             stack.enter_context(patch.object(u, "launchd_jobs", side_effect=lambda *a: ["gui/501/com.PM2"] if backend["loaded"] else []))
             stack.enter_context(patch.object(u, "launchagent_config", side_effect=lambda *a: (file, u.plistlib.loads(file.read_bytes()))))
-            stack.enter_context(patch.object(u, "startup_check", return_value={"status": "config-passed"}))
+            stack.enter_context(patch.object(u, "startup_check", return_value={"status": "config-passed", "details": "fixture service verified"}))
             stack.enter_context(patch.object(u, "startup_node_check", return_value={"status": "match" if node_match else "mismatch", "node": target}))
             original_wait = u.wait_startup_apps
             def wait(*arguments):
@@ -104,12 +114,13 @@ class RestartupTests(unittest.TestCase):
             return {**backend, "result": result, "error": error,
                     "recovery": json.loads(recovery.read_text()) if recovery.exists() else None,
                     "backup": saved_original.read_bytes() if saved_original.exists() else None,
+                    "dump": (home / "dump.pm2").read_bytes() if (home / "dump.pm2").exists() else None,
                     "config_exists": file.exists(), "authorization_called": authorize.called}
 
     def test_systemd_rebuild_restores_apps_via_service(self):
         result = self.scenario()
         self.assertIsNone(result["error"])
-        self.assertEqual(result["events"], ["save", "unstartup", "startup", "644", "daemon-reload", "start"])
+        self.assertEqual(result["events"], ["save", "unstartup", "startup", "644", "daemon-reload", "reset-failed", "start"])
         self.assertEqual(result["backup"], b"original startup definition\n")
         self.assertTrue(result["daemon"])
         self.assertEqual(result["result"]["status"], "config-passed")
@@ -119,6 +130,20 @@ class RestartupTests(unittest.TestCase):
         self.assertNotIn("unstartup", result["events"])
         self.assertTrue(result["config_exists"])
         self.assertIsNone(result["error"])
+
+    def test_first_configuration_hands_terminal_daemon_to_systemd(self):
+        result = self.scenario(exists=False)
+        self.assertIsNone(result["error"])
+        self.assertLess(result["events"].index("save"), result["events"].index("kill"))
+        self.assertLess(result["events"].index("kill"), result["events"].index("startup"))
+        self.assertTrue(result["owned"])
+
+    def test_inactive_service_does_not_leave_terminal_daemon_running(self):
+        result = self.scenario(unmanaged=True)
+        self.assertIsNone(result["error"])
+        self.assertLess(result["events"].index("unstartup"), result["events"].index("kill"))
+        self.assertLess(result["events"].index("kill"), result["events"].index("start"))
+        self.assertTrue(result["owned"])
 
     def test_launchd_unloads_actual_label(self):
         result = self.scenario(system="launchd")
@@ -165,11 +190,54 @@ class RestartupTests(unittest.TestCase):
         self.assertEqual(result["events"], [])
         self.assertTrue(result["config_exists"])
 
-    def test_absent_daemon_does_not_restore_stale_dump(self):
-        result = self.scenario(no_daemon=True)
+    def test_absent_daemon_initializes_empty_service_without_terminal_resurrect(self):
+        result = self.scenario(no_daemon=True, exists=False)
+        self.assertIsNone(result["error"])
+        self.assertTrue(result["owned"])
+        self.assertNotIn("save", result["events"])
+        self.assertNotIn("resurrect", result["events"])
+        self.assertEqual(json.loads(result["dump"]), [])
+        self.assertEqual(result["result"]["application_count"], 0)
+
+    def test_existing_empty_daemon_can_be_rebuilt(self):
+        result = self.scenario(empty=True, unmanaged=True, saved_dump=b"[]")
+        self.assertIsNone(result["error"])
+        self.assertIn("kill", result["events"])
+        self.assertNotIn("save", result["events"])
+        self.assertTrue(result["owned"])
+
+    def test_empty_initialization_failure_does_not_create_unmanaged_daemon(self):
+        result = self.scenario(no_daemon=True, exists=False, fail="start")
+        self.assertIn("start failure", result["error"])
+        self.assertFalse(result["daemon"])
+        self.assertNotIn("resurrect", result["events"])
+        self.assertEqual(result["recovery"]["status"], "no-applications")
+
+    def test_absent_daemon_does_not_restore_or_overwrite_stale_dump(self):
+        original = b'[{"name":"saved-app"}]'
+        result = self.scenario(no_daemon=True, saved_dump=original)
         self.assertEqual(result["events"], [])
         self.assertFalse(result["authorization_called"])
-        self.assertIn("没有运行中的 PM2", result["error"])
+        self.assertIn("未覆盖或自动恢复", result["error"])
+        self.assertEqual(result["dump"], original)
+
+    def test_empty_daemon_does_not_overwrite_saved_applications(self):
+        result = self.scenario(empty=True, saved_dump=b'[{"name":"saved-app"}]')
+        self.assertEqual(result["events"], [])
+        self.assertFalse(result["authorization_called"])
+
+    def test_initialization_protects_backup_and_corrupt_dumps(self):
+        for original in (b'[{"name":"saved-app"}]', b'invalid json', b'{}'):
+            with self.subTest(original=original):
+                result = self.scenario(no_daemon=True, saved_dump=b'[]', backup_dump=original)
+                self.assertEqual(result["events"], [])
+                self.assertFalse(result["authorization_called"])
+                self.assertIn("dump.pm2.bak", result["error"])
+
+    def test_missing_pid_with_rpc_socket_requires_inspection(self):
+        result = self.scenario(no_daemon=True, orphan_socket=True)
+        self.assertEqual(result["events"], [])
+        self.assertIn("PID 无法核实", result["error"])
 
     def test_node_mismatch_is_not_success(self):
         result = self.scenario(node_match=False)

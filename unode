@@ -27,7 +27,7 @@ import urllib.parse
 import urllib.request
 from xml.parsers.expat import ExpatError
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 HELPER = Path(__file__).resolve().with_name("pm2-helper.cjs")
 NODE_INDEX = "https://nodejs.org/dist/index.json"
 NVM_RELEASE = "v0.40.8"
@@ -356,10 +356,10 @@ def verify_original_apps(before, after, target_version):
             raise UnodeError("cluster 实例 Node 版本不符：" + str(app.get("name")))
 
 
-def check_original_apps(snapshot):
+def check_original_apps(snapshot, allow_empty=False):
     if not snapshot:
         return
-    if not snapshot["apps"]:
+    if not snapshot["apps"] and not allow_empty:
         raise UnodeError("PM2 进程表为空，不执行迁移；如只升级 Node，请选择不处理 PM2")
     bad = ["{}（{}）".format(app.get("name", "?"), app["pm2_env"].get("status")) for app in snapshot["apps"] if app["pm2_env"].get("status") not in ("online", "stopped")]
     if bad:
@@ -1009,7 +1009,8 @@ def startup_check(home, target, service=None):
         issues.append("服务文件更新后尚未 daemon-reload")
     if data.get("ActiveState") != "active":
         issues.append("系统服务当前不是 active，已有 PM2 可能由终端手动启动")
-    if data.get("MainPID", "0") != str(daemon_pid(home) or 0):
+    pid = daemon_pid(home)
+    if not pid or data.get("MainPID", "0") != str(pid):
         issues.append("系统服务 MainPID 与此 PM2_HOME 的后台 PID 不一致")
     try:
         env = dict(item.split("=", 1) for item in shlex.split(data.get("Environment", "")) if "=" in item)
@@ -1033,8 +1034,8 @@ def startup_check(home, target, service=None):
     dump = home / "dump.pm2"
     try:
         saved = json.loads(dump.read_text())
-        if not isinstance(saved, list) or not saved:
-            raise ValueError("empty dump")
+        if not isinstance(saved, list):
+            raise ValueError("invalid dump")
         for app in saved:
             if not isinstance(app, dict):
                 raise ValueError("invalid dump entry")
@@ -1046,7 +1047,7 @@ def startup_check(home, target, service=None):
             if interpreter.startswith("/") and not os.access(interpreter, os.X_OK):
                 issues.append("保存的解释器路径不可执行：" + str(app.get("name", "?")))
     except (OSError, ValueError, TypeError, AttributeError):
-        issues.append("保存的 dump.pm2 不可读、为空或格式异常")
+        issues.append("保存的 dump.pm2 不可读或格式异常")
     return {"status": "needs-review" if issues else "config-passed", "unit": unit, "issues": issues, "properties": data,
             "details": "仅检查配置，不代表已验证机器重启"}
 
@@ -1085,7 +1086,7 @@ def migrate_pm2(args, target, old_package, before, state):
         package = pm2_package(node)
         if not package or (old_package and package["version"] != wanted):
             raise UnodeError("目标环境的 PM2 软件版本不符合预期")
-    if before:
+    if before and before["apps"]:
         section("PM2 更新与验收")
         command = [node, HELPER, "--pm2-dir", package["dir"], "--pm2-home", args.pm2_home,
                    "--apply", "--backup-root", state.folder / "pm2", "--settle", str(args.settle), "--interactive-kill"]
@@ -1104,7 +1105,7 @@ def migrate_pm2(args, target, old_package, before, state):
         section("开机启动配置检查")
         startup = save_startup(state, args.pm2_home, target, package, args.service)
     else:
-        print("✓ PM2 软件包已就绪；没有原运行中的应用，不创建空后台、不执行 resurrect。")
+        print("✓ PM2 软件包已就绪；没有原应用，后台及自启按 restartup 选择处理。")
         if args.health_url:
             health_check(args.health_url)
         startup = {"status": "not-applicable", "details": "没有运行中的 PM2 应用"}
@@ -1229,15 +1230,28 @@ def perform_restartup(args, target, state, context=None):
     package, env, file = context["package"], context["env"], context["file"]
     entry = Path(package["dir"]) / "bin/pm2"
     before = pm2_snapshot(target["path"], package, args.pm2_home)
-    check_original_apps(before)
-    if not before:
-        raise UnodeError("没有运行中的 PM2；请先启动需要管理的应用，未恢复旧 dump 或创建空后台")
+    check_original_apps(before, allow_empty=True)
+    initializing = not before or not before["apps"]
+    if initializing:
+        if before is None and (args.pm2_home / "rpc.sock").exists():
+            raise UnodeError("PM2 RPC socket 存在但后台 PID 无法核实；请先检查后台状态，未覆盖应用清单")
+        for name in ("dump.pm2", "dump.pm2.bak"):
+            source = args.pm2_home / name
+            if not source.exists():
+                continue
+            try:
+                contents = json.loads(source.read_text())
+            except (OSError, ValueError) as exc:
+                raise UnodeError("无法核实已有 {}；请先备份并检查，未初始化空后台".format(name)) from exc
+            if contents != []:
+                raise UnodeError("已有 {} 包含应用或格式异常；请先明确恢复或备份移走，未覆盖或自动恢复".format(name))
+    before = before or {"apps": []}
     section("PM2 startup 重建")
     ui("目标 Node：{}（{}）".format(highlight(target["version"]), target["path"]))
     ui("PM2：" + str(entry))
     ui("PM2_HOME：" + str(args.pm2_home))
     ui("启动配置：" + str(file))
-    ui("执行 pm2 save → unstartup → startup；可能重启受管应用。")
+    ui("没有应用：初始化空清单并配置自启。" if initializing else "执行 pm2 save → unstartup → startup；可能重启受管应用。")
     state.write(state.folder / "restartup-before.json", before)
     if context["exists"]:
         state.write(state.folder / "startup-config.original", file.read_bytes())
@@ -1247,7 +1261,11 @@ def perform_restartup(args, target, state, context=None):
             state.write(state.folder / (name + ".pre-restartup"), source.read_bytes())
     startup_authorize()
     log = state.folder / "restartup.log"
-    run([target["path"], entry, "save"], env=env, log=log)
+    if initializing:
+        # Do not invoke PM2 CLI here: it would create a daemon outside the service.
+        state.write(args.pm2_home.resolve() / "dump.pm2", b"[]\n")
+    else:
+        run([target["path"], entry, "save"], env=env, log=log)
     saved = (args.pm2_home / "dump.pm2").read_bytes()
     state.write(state.folder / "dump.pm2.restartup", saved)
     common = [context["platform"], "-u", env["USER"], "--service-name", context["service"]]
@@ -1265,12 +1283,19 @@ def perform_restartup(args, target, state, context=None):
             if launchd_jobs("com.PM2", file):
                 raise UnodeError("旧 launchd 服务未成功卸载")
             file.parent.mkdir(parents=True, exist_ok=True)
+        # unstartup only stops processes owned by the old service. A daemon
+        # started by a terminal/update can survive and cannot be adopted by systemd.
+        if daemon_pid(args.pm2_home):
+            run([target["path"], entry, "kill"], env=env, log=log)
+            if daemon_pid(args.pm2_home):
+                raise UnodeError("旧 PM2 后台未退出，未启动新服务")
         startup_admin([target["path"], entry, "startup", *common], env, log)
         if not file.is_file():
             raise UnodeError("pm2 startup 没有生成启动配置")
         startup_admin(["/bin/chmod", "644", file], env, log)
         if context["platform"] == "systemd":
             startup_admin(["systemctl", "daemon-reload"], env, log)
+            startup_admin(["systemctl", "reset-failed", context["unit"]], env, log)
             startup_admin(["systemctl", "start", context["unit"]], env, log)
             run(["systemctl", "is-enabled", context["unit"]], log=log)
             run(["systemctl", "is-active", context["unit"]], log=log)
@@ -1306,16 +1331,16 @@ def perform_restartup(args, target, state, context=None):
                     result.update(status="needs-review", details="启动配置及应用已验证；未观察到一次性任务注册，无法确认启动执行结果；未验证下次登录/重启恢复")
             else:
                 result["launchd_status"] = "loaded"
+        result["application_count"] = len(after["apps"])
+        if initializing:
+            result["details"] += "；当前没有应用，启动应用后请执行 pm2 save"
         state.write(state.folder / "startup-check.json", result)
         return result
     except BaseException as exc:
         recovery = {"status": "not-needed"}
         if mutated:
             try:
-                try:
-                    current = pm2_snapshot(target["path"], package, args.pm2_home)
-                    verify_original_apps(before, current, current["report"]["node_version"].lstrip("v") if current else target["version"])
-                except UnodeError:
+                if initializing:
                     if context["platform"] == "systemd":
                         startup_admin(["systemctl", "stop", context["unit"]], env, log, check=False)
                     else:
@@ -1323,16 +1348,37 @@ def perform_restartup(args, target, state, context=None):
                             startup_admin(["/bin/launchctl", "bootout", job], env, log)
                     if daemon_pid(args.pm2_home):
                         run([target["path"], entry, "kill"], env=env, log=log)
-                    state.write(args.pm2_home.resolve() / "dump.pm2", saved)
-                    run([target["path"], entry, "resurrect"], env=env, log=log)
-                    wait_startup_apps(before, target, package, args.pm2_home, args.settle)
-                recovery = {"status": "applications-available", "details": "原应用状态已核实；启动配置仍需处理"}
+                    recovery = {"status": "no-applications", "details": "没有原应用需要恢复；未在服务外重新创建空后台"}
+                else:
+                    recovery = recover_startup_apps(args, target, state, context, before, saved, log)
             except BaseException as recovery_error:
                 recovery = {"status": "failed", "error": str(recovery_error)}
             state.write(state.folder / "restartup-recovery.json", recovery)
         if isinstance(exc, (KeyboardInterrupt, EOFError)):
             raise
         raise UnodeError("startup 重建失败：{}；恢复结果：{}；备份：{}".format(exc, recovery["status"], state.folder)) from exc
+
+
+def recover_startup_apps(args, target, state, context, before, saved, log):
+    package = context["package"]
+    env = context["env"]
+    entry = Path(package["dir"]) / "bin/pm2"
+    file = context["file"]
+    try:
+        current = pm2_snapshot(target["path"], package, args.pm2_home)
+        verify_original_apps(before, current, current["report"]["node_version"].lstrip("v") if current else target["version"])
+    except UnodeError:
+        if context["platform"] == "systemd":
+            startup_admin(["systemctl", "stop", context["unit"]], env, log, check=False)
+        else:
+            for job in launchd_jobs("com.PM2", file):
+                startup_admin(["/bin/launchctl", "bootout", job], env, log)
+        if daemon_pid(args.pm2_home):
+            run([target["path"], entry, "kill"], env=env, log=log)
+        state.write(args.pm2_home.resolve() / "dump.pm2", saved)
+        run([target["path"], entry, "resurrect"], env=env, log=log)
+        wait_startup_apps(before, target, package, args.pm2_home, args.settle)
+    return {"status": "applications-available", "details": "原应用状态已核实；启动配置仍需处理"}
 
 
 def restartup_main(argv):
@@ -1469,7 +1515,7 @@ def main(argv=None):
             raise UnodeError("读取旧 PM2 环境需要 Node >=18；请使用已验证的新 Node 和 --pm2-dir")
         old_package = pm2_package(current["path"] if current else None, args.pm2_dir)
         before = pm2_snapshot(current["path"], old_package, args.pm2_home) if current and daemon_pid(args.pm2_home) else None
-        check_original_apps(before)
+        check_original_apps(before, allow_empty=True)
         if not current and daemon_pid(args.pm2_home):
             raise UnodeError("存在 PM2 后台但当前无可用 Node，无法备份，请先恢复原 Node 环境")
         if not old_package:
@@ -1497,8 +1543,8 @@ def main(argv=None):
         if manager.name in ("n", "system"):
             ui("注意：该方式可能替换共享 Node 安装，影响其他使用该路径的服务。")
     if process_pm2:
-        ui("PM2：{}；{}".format("保持软件版本 " + old_package["version"] if old_package else "首次安装", "迁移后台、核验 cluster 和开机配置" if before else "无运行中的应用，不创建后台"))
-        if before:
+        ui("PM2：{}；{}".format("保持软件版本 " + old_package["version"] if old_package else "首次安装", "迁移后台、核验 cluster 和开机配置" if before and before["apps"] else "没有原应用；选择 restartup 时初始化后台及自启"))
+        if before and before["apps"]:
             counts = Counter(app["pm2_env"].get("status") for app in before["apps"])
             ui("在线应用：{} 个，更新时重启并验收。".format(counts["online"]))
             ui("已停止应用：{} 个，保持停止，不拉起。".format(counts["stopped"]))
@@ -1532,7 +1578,7 @@ def main(argv=None):
         section("执行与验证")
         ui("备份和日志：" + str(folder))
         try:
-            if before:
+            if before and before["apps"]:
                 fresh = pm2_snapshot(current["path"], old_package, args.pm2_home)
                 verify_original_apps(before, fresh, before["report"]["node_version"].lstrip("v"))
                 check_original_apps(fresh)

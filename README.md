@@ -61,7 +61,7 @@ unode restartup --check      # 只查看重建目标和版本检查
 
 已经安装的目标版本会直接使用；版本和来源都与当前一致时跳过 Node 安装与切换，仍按选择决定是否处理 PM2。**脚本不能修改父终端的环境**，运行结束会输出当前终端需要执行的 `nvm use` / `fnm use` 或 PATH 提示。PM2 会明确通过目标 Node 执行，不依赖父终端是否已切换。
 
-`--pm2` 不显示 Node 管理方式/版本选择，也不再次询问是否处理 PM2；仍先展示并确认实际操作。如果未安装 PM2，计划会明确说明将安装；没有原运行中的应用时不创建空后台或盲目恢复旧 dump。
+`--pm2` 不显示 Node 管理方式/版本选择，也不再次询问是否处理 PM2；仍先展示并确认实际操作。如果未安装 PM2，计划会明确说明将安装。没有原应用时，选择 restartup 会初始化空清单并由系统服务启动 PM2；跳过 restartup 时仅准备软件包，不创建后台。已有非空或损坏的 dump 不会被覆盖或自动恢复。
 
 普通 `--check` 默认不触碰 PM2；要只读检查 PM2 请使用 `--pm2 --check`。正式执行必须在交互终端进行，没有 `--yes` 自动批准模式。独立 `restartup` 命令展示目标后直接执行，sudo 授权照常保留。
 
@@ -92,7 +92,7 @@ unode restartup --check      # 只查看重建目标和版本检查
 - 默认要求 PID/restart 计数连续稳定 30 秒；`--settle` 可调整。恢复总等待上限约为该时间的两倍。
 - 不会修改业务的 package.json、node_modules、构建产物；原生扩展和应用对目标 Node 的兼容性须先在业务环境验证。
 
-`pm2 update` 和 kill/resurrect 会重启原来运行的应用，请在维护窗口执行。普通 stopped 应用通过 PM2 保存的 status 恢复，保持停止，不要求手动启动它们。只有 errored/launching/stopping 等异常或过渡状态、空进程表会阻止迁移。已停止的 PM2 插件（pmx_module）另需人工处理，因为原生 update 会自动加载插件；普通应用不受此限制。没有后台时只准备软件包，不执行 resurrect。
+`pm2 update` 和 kill/resurrect 会重启原来运行的应用，请在维护窗口执行。普通 stopped 应用通过 PM2 保存的 status 恢复，保持停止，不要求手动启动它们。errored/launching/stopping 等异常或过渡状态会阻止迁移；没有应用时跳过 update，按 restartup 选择初始化后台及自启。已停止的 PM2 插件（pmx_module）另需人工处理，因为原生 update 会自动加载插件；普通应用不受此限制。
 
 支持自定义目录、服务和业务健康检查：
 
@@ -145,11 +145,13 @@ unode restartup
 unode restartup --service my-pm2 --pm2-home /srv/app/.pm2
 ```
 
-重建前备份配置及 dump，执行 `pm2 save`。有旧配置时执行 `pm2 unstartup`，再执行 `pm2 startup`；首次配置跳过 unstartup。明确使用目标 Node/PM2、目标 PATH 和同步后的 NVM_BIN/NVM_INC；sudo 命令显式保留原 HOME、用户和 PM2_HOME，不解析执行 PM2 打印的 shell 文本，不引入额外的 shell 环境切换方案。
+重建前备份配置及 dump，有应用时执行 `pm2 save`。有旧配置时执行 `pm2 unstartup`，再执行 `pm2 startup`；首次配置跳过 unstartup。注册新配置前结束仍存活的原 PM2 后台，避免 systemd 拒绝接管终端启动的进程。明确使用目标 Node/PM2、目标 PATH 和同步后的 NVM_BIN/NVM_INC；sudo 命令显式保留原 HOME、用户和 PM2_HOME，不解析执行 PM2 打印的 shell 文本，不引入额外的 shell 环境切换方案。
 
-**重建可能中断应用。** Linux 的 unstartup 会停止服务，默认 ExecStop 执行 pm2 kill；startup 注册后会 daemon-reload 并启动服务。macOS 按 plist 的实际 Label 卸载旧服务，检查新服务的加载结果。随后验证应用数量、原 online/stopped 状态、连续稳定性、启动 Node 版本及路径；有 `--health-url` 时再次检查业务。
+**重建可能中断应用。** Linux 的 unstartup 会停止服务，默认 ExecStop 执行 pm2 kill；startup 注册后会 daemon-reload、清除旧失败状态并启动服务。macOS 按 plist 的实际 Label 卸载旧服务，检查新服务的加载结果。随后验证应用数量、原 online/stopped 状态、连续稳定性、启动 Node 版本及路径；有 `--health-url` 时再次检查业务。
 
-没有运行中的 PM2 时明确报错，不恢复遗留 dump 或创建空后台。未知的自定义启动命令、用户/PM2_HOME 不符、systemd drop-in/EnvironmentFile 不直接覆盖；PM2 生成器无法正确引用的带空格或特殊字符的启动文件/PM2 路径会在修改前报错。失败时尝试恢复原应用，并保存 `restartup-recovery.json`；启动配置仍可能需要根据备份人工修复，不伪报成功。不执行机器重启。
+没有后台或后台应用表为空时，允许初始化自启：仅当 `dump.pm2` 和 `dump.pm2.bak` 均不存在或为 `[]`，才写入空清单，由系统服务启动后台并验收。已有应用清单、损坏清单、RPC socket 存在但 PID 无法核实的情况会在修改前报错。初始化失败时不在服务外重新创建空后台；成功后可用 `pm2 start ...` 添加应用，再执行 `pm2 save` 保存。
+
+未知的自定义启动命令、用户/PM2_HOME 不符、systemd drop-in/EnvironmentFile 不直接覆盖；PM2 生成器无法正确引用的带空格或特殊字符的启动文件/PM2 路径会在修改前报错。失败时尝试恢复原应用，并保存 `restartup-recovery.json`；启动配置仍可能需要根据备份人工修复，不伪报成功。不执行机器重启。
 
 原迁移检查仍会生成 `startup-commands.txt` 供维护参考，程序不会执行该文本文件。
 
