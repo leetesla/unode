@@ -7,6 +7,9 @@
 - 注册新配置前结束终端启动或迁移后遗留的 PM2 后台，防止 systemd 因 PID 不属于服务而报 `Result: protocol`；清除旧失败状态后启动并检查服务。
 - 空后台初始化保护 `dump.pm2` 和 `dump.pm2.bak` 中的旧应用及损坏数据；PID 缺失但 RPC socket 存在时拒绝覆盖。初始化失败不在服务外恢复空后台。
 - macOS 本地 120 项 Python 测试全部通过，含真实隔离 PM2 恢复及 Node 20 → Node 22 的迁移；21 项 Node helper 测试全部通过。Python 3.8 语法兼容、安装脚本语法、diff 检查通过。
+- 在用户授权的 Linux 服务器以 gituser 拉取更新并安装全局命令，卸载 PM2 后通过真实终端执行 `unode --pm2 --settle 3` 重新安装，空后台及开机配置成功完成。
+- 真实 systemd 的 8 项检查全部通过：首次空安装、已有空服务重建、空服务重启、首次配置接管终端后台、已有 inactive 配置接管终端后台、服务重启保留 online/stopped 状态、保护非空备份、最终空服务状态。每次核实 MainPID/PID 文件一致、cgroup 归属、实际 Node 路径，以及运行目录和文件归 gituser 所有；stopped 应用的入口执行次数没有增加。
+- 测试应用及临时 sudo 授权已清理，最终 `pm2-gituser.service` 为 enabled/active，应用表和 dump 均为空；`unode show startup` 返回 0。服务器备份和日志位于 `/var/backups/unode-validation-20261028-020058/`，本地摘要为 `work/server-validation-result.json`。只执行服务重启，没有执行机器重启。
 
 日期：2026-10-27，当前源码版本 0.1.2。测试平台：macOS。本次更新全局安装的 unode，保留 `/etc/unode/config.json`；没有升级真实用户的 Node、修改业务 PM2 或重启真实系统服务。此前对用户真实 PM2 仅做了直接 RPC 只读检查，确认 13 个 online、4 个普通 stopped 应用；没有对它们执行 update/save/stop/start/kill。
 
