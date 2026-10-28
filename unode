@@ -774,11 +774,7 @@ def startup_node_binary(arguments, environment):
     if not isinstance(arguments, list) or not arguments or not all(isinstance(a, str) for a in arguments):
         raise UnodeError("启动命令无法解析")
     if arguments[0] in ("/bin/sh", "/bin/bash", "/bin/zsh"):
-        if len(arguments) != 3 or arguments[1] != "-c" or re.search(r"[$;|&<>\n]" + "", arguments[2]):
-            # Backticks are rejected separately without embedding one in a
-            # template-heavy source transformation.
-            if chr(96) in arguments[2]:
-                raise UnodeError("自定义 shell 启动命令需人工复核")
+        if len(arguments) != 3 or arguments[1] != "-c" or re.search(r"[$;|&<>\n]", arguments[2]) or chr(96) in arguments[2]:
             raise UnodeError("自定义 shell 启动命令需人工复核")
         arguments = shlex.split(arguments[2])
         if not arguments:
